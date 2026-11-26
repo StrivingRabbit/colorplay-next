@@ -42,10 +42,10 @@ data class GradientSpecs(
 data class GlassSpecs(
     /** 面板半透填充。 */
     val panelBrush: Brush,
-    /** 1px 描边基色。 */
+    /** 轻描边基色。 */
     val strokeColor: Color,
     /** 描边宽度。 */
-    val strokeWidth: Dp = 1.dp,
+    val strokeWidth: Dp = 0.5.dp,
     /** 圆角。 */
     val cornerRadius: Dp = 20.dp,
     /** 辉光颜色（可选发光）。 */

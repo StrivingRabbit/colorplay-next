@@ -87,6 +87,8 @@ import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.ui.components.CarBrandBadge
 import io.github.hypercar.ui.components.CapsuleButton
 import io.github.hypercar.ui.components.GlassPanel
+import io.github.hypercar.ui.components.floatingChromeBottomPadding
+import io.github.hypercar.ui.components.floatingChromeTopPadding
 import io.github.hypercar.ui.components.InfoRow
 import io.github.hypercar.ui.components.SectionLabel
 import io.github.hypercar.ui.theme.AmberWarning
@@ -140,6 +142,7 @@ fun SettingsScreen(
     }
 
     Column(modifier = modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Spacer(Modifier.height(floatingChromeTopPadding()))
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             if (page != SettingsPage.Main) {
                 TextButton(onClick = { open(page.parent) }) { Text("‹ 返回", color = ElectricCyan) }
@@ -166,7 +169,7 @@ fun SettingsScreen(
                                 showProjectionApps = true
                             }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-                            SettingsMenuItem("主题与外观", "跟随系统、HyperOS 风格浅色与深色") { open(SettingsPage.Appearance) }
+                            SettingsMenuItem("主题与外观", "跟随系统、ColorOS 风格浅色与深色") { open(SettingsPage.Appearance) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("权限与后台", "系统权限、后台运行与 Shizuku 授权") { open(SettingsPage.Permissions) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
@@ -202,7 +205,7 @@ fun SettingsScreen(
                     SettingsPage.Developer -> DeveloperMenuSection()
                     SettingsPage.HeadUnitPicker -> Unit
                 }
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(floatingChromeBottomPadding()))
             }
         }
     }
@@ -365,7 +368,7 @@ private fun AppearanceSection() {
             style = MaterialTheme.typography.bodySmall)
     }
     GlassPanel(modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(16.dp)) {
-        Text(if (io.github.hypercar.ui.theme.LocalAppPalette.current.dark) "当前：深色主题" else "当前：HyperOS 风格浅色主题",
+        Text(if (io.github.hypercar.ui.theme.LocalAppPalette.current.dark) "当前：深色主题" else "当前：ColorOS 风格浅色主题",
             color = TextPrimary, style = MaterialTheme.typography.titleSmall)
         Spacer(Modifier.height(6.dp))
         Text(if (io.github.hypercar.ui.theme.LocalAppPalette.current.dark) "深空背景 · 青色强调 · 玻璃卡片"
@@ -823,11 +826,11 @@ private fun PermissionSettingsSection() {
 
             Spacer(modifier = Modifier.height(6.dp))
             Text(
-                text = "自启动、电池白名单属系统专有设置，部分系统不提供查询接口，" +
-                    "显示「去设置」不代表未开启。",
+                text = "ColorOS 等系统的后台管理入口与名称可能不同，请按实际提供的选项设置；" +
+                    "若没有自启动开关，无需寻找同名项。部分状态无法查询，显示「去设置」不代表未开启。",
                 style = MaterialTheme.typography.labelSmall,
                 color = TextSecondary.copy(alpha = 0.75f),
-                maxLines = 2,
+                maxLines = 5,
                 overflow = TextOverflow.Ellipsis,
             )
         }

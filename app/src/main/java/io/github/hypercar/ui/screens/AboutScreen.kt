@@ -5,9 +5,7 @@ import android.net.Uri
 import android.os.SystemClock
 import android.widget.Toast
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -15,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -33,15 +32,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.res.colorResource
+import androidx.core.graphics.drawable.toBitmap
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import io.github.hypercar.R
+import io.github.hypercar.UpstreamBase
 import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.ui.components.CapsuleButton
 import io.github.hypercar.ui.components.GlassPanel
@@ -64,6 +62,9 @@ import kotlinx.coroutines.launch
 @Composable
 fun AboutScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
+    val appIcon = remember(context) {
+        context.applicationInfo.loadIcon(context.packageManager).toBitmap(192, 192).asImageBitmap()
+    }
     val scope = rememberCoroutineScope()
     val state by UpdateCenter.state.collectAsStateWithLifecycle()
     val checking = state is UpdateUiState.Checking
@@ -77,21 +78,14 @@ fun AboutScreen(modifier: Modifier = Modifier) {
             .padding(horizontal = 16.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
+        Spacer(Modifier.height(io.github.hypercar.ui.components.floatingChromeTopPadding()))
         // ---- 品牌头 ----
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                Modifier.size(72.dp)
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(colorResource(R.color.ic_launcher_background)),
-            ) {
-                // The launcher foreground includes adaptive-icon safe-area padding.
-                // Enlarge only the artwork inside the badge, keeping its outer bounds clipped.
-                Image(
-                    painter = painterResource(R.drawable.ic_launcher_glyph),
-                    contentDescription = "ColorPlay Next 标志",
-                    modifier = Modifier.fillMaxSize().scale(1.55f),
-                )
-            }
+            Image(
+                bitmap = appIcon,
+                contentDescription = "ColorPlay Next 应用启动图标",
+                modifier = Modifier.size(72.dp).clip(RoundedCornerShape(20.dp)),
+            )
             Spacer(modifier = Modifier.width(14.dp))
             Column {
                 Text(
@@ -102,7 +96,7 @@ fun AboutScreen(modifier: Modifier = Modifier) {
                     color = TextPrimary,
                 )
                 Text(
-                    text = "Android 无线 CarPlay 互联\n支持自绘界面与 CarWith",
+                    text = "Android 无线 CarPlay 互联\n支持 OPPO Car+ 与系统 CarLife+",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary,
                 )
@@ -136,12 +130,23 @@ fun AboutScreen(modifier: Modifier = Modifier) {
             GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
                 InfoRow(label = "开源来源", value = "基于 HyperCar")
                 InfoRow(label = "原项目作者", value = "fw867")
+                InfoRow(label = "底座导入版本", value = "${UpstreamBase.VERSION} / code ${UpstreamBase.CODE}")
                 InfoRow(
-                    label = "开源仓库",
-                    value = "github.com/fw867/hypercar",
-                    onClick = { openUrl(context, "https://github.com/fw867/hypercar") },
+                    label = "底座导入提交",
+                    value = UpstreamBase.COMMIT.take(12),
+                    onClick = { openUrl(context, "${UpstreamBase.REPO}/commit/${UpstreamBase.COMMIT}") },
                 )
-                InfoRow(label = "更新来源", value = "GitHub Releases")
+                InfoRow(
+                    label = "上游开源仓库",
+                    value = UpstreamBase.REPO.removePrefix("https://"),
+                    onClick = { openUrl(context, UpstreamBase.REPO) },
+                )
+                InfoRow(label = "开源许可证", value = "GNU GPL v3")
+                Text(
+                    text = "ColorPlay Next 基于 HyperCar 修改，保留原项目作者与 GPL 归属。本应用仅用于个人研究，与 BMW / Apple / 高德无隶属关系；按 GPL 许可证提供，不作任何担保。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                )
             }
         }
 
@@ -149,6 +154,12 @@ fun AboutScreen(modifier: Modifier = Modifier) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SectionLabel(text = "更新")
             GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)) {
+                Text(
+                    text = "检查更新仅更新 ColorPlay Next APK，不会直接安装或更新 HyperCar 底座。新底座需由开发者合并上游代码、完成测试并重新签名发布；可通过上方链接查看上游仓库与已导入提交。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                )
+                Spacer(modifier = Modifier.height(10.dp))
                 when (val s = state) {
                     is UpdateUiState.Available -> {
                         Text(
@@ -197,7 +208,7 @@ fun AboutScreen(modifier: Modifier = Modifier) {
                     )
 
                     UpdateUiState.Idle -> Text(
-                        text = "更新来自 GitHub Releases；每次推送由 CI 自动构建正式签名包。",
+                        text = "ColorPlay Next APK 更新来自本项目的 GitHub Releases。",
                         style = MaterialTheme.typography.bodySmall,
                         color = TextSecondary,
                         maxLines = 2,
@@ -215,7 +226,7 @@ fun AboutScreen(modifier: Modifier = Modifier) {
                 )
             }
         }
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.navigationBarsPadding().height(120.dp))
     }
 }
 

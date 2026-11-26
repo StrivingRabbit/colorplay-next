@@ -116,8 +116,10 @@ android {
 }
 
 dependencies {
-    val composeBom = platform("androidx.compose:compose-bom:2024.09.03")
+    val composeBom = platform("androidx.compose:compose-bom:2025.11.00")
     implementation(composeBom)
+    // 最低稳定版已具备背景采样、RenderEffect 模糊与 AGSL 镜头折射。
+    implementation("io.github.kyant0:backdrop:1.0.0")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")

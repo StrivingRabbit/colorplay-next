@@ -42,6 +42,10 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.runtime.CompositionLocalProvider
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import com.kyant.backdrop.backdrops.layerBackdrop
+import io.github.hypercar.ui.components.LocalLiquidBackdrop
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -190,6 +194,7 @@ class MainActivity : ComponentActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.statusBarColor = android.graphics.Color.TRANSPARENT
         window.navigationBarColor = android.graphics.Color.TRANSPARENT
+        window.isNavigationBarContrastEnforced = false
         WindowInsetsControllerCompat(window, window.decorView).apply {
             isAppearanceLightStatusBars = false
             isAppearanceLightNavigationBars = false
@@ -206,6 +211,7 @@ class MainActivity : ComponentActivity() {
                 SideEffect {
                     window.statusBarColor = android.graphics.Color.TRANSPARENT
                     window.navigationBarColor = android.graphics.Color.TRANSPARENT
+        window.isNavigationBarContrastEnforced = false
                     WindowInsetsControllerCompat(window, window.decorView).apply {
                         isAppearanceLightStatusBars = !dark
                         isAppearanceLightNavigationBars = !dark
@@ -349,58 +355,24 @@ private fun MainContent(onStart: () -> Unit) {
         )
     }
 
-    Scaffold(
-        containerColor = DeepSpace,
-        topBar = { StatusStrip(link = snapshot.link) },
-        bottomBar = {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .navigationBarsPadding()
-                    .padding(horizontal = 20.dp, vertical = 12.dp),
-            ) {
-                NavigationBar(
-                    modifier = Modifier.glassPanel(cornerRadius = 32.dp),
-                    containerColor = Color.Transparent,
-                    tonalElevation = 0.dp,
-                    windowInsets = WindowInsets(0, 0, 0, 0),
-                ) {
-                    tabs.forEachIndexed { index, tab ->
-                        NavigationBarItem(
-                            selected = tabIndex == index,
-                            onClick = { tabIndex = index },
-                            icon = {
-                                Icon(
-                                    imageVector = tab.icon,
-                                    contentDescription = tab.title,
-                                    modifier = Modifier.size(22.dp),
-                                )
-                            },
-                            label = {
-                                Text(
-                                    text = tab.title,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    maxLines = 1,
-                                )
-                            },
-                            colors = NavigationBarItemDefaults.colors(
-                                selectedIconColor = ElectricCyan,
-                                selectedTextColor = ElectricCyan,
-                                unselectedIconColor = TextSecondary,
-                                unselectedTextColor = TextSecondary,
-                                indicatorColor = ElectricCyan.copy(alpha = 0.14f),
-                            ),
-                        )
-                    }
-                }
-            }
-        },
-    ) { innerPadding ->
+    val backgroundBackdrop = rememberLayerBackdrop()
+    val contentBackdrop = rememberLayerBackdrop()
+    // ColorPlay Next chrome: two one-way sampled layers keep the fork's glass separate from session logic.
+    CompositionLocalProvider(LocalLiquidBackdrop provides backgroundBackdrop) {
+    Box(Modifier.fillMaxSize()) {
+        // Record only the background for page glass; never record a component into its own source.
+        HyperCarBackground(Modifier.layerBackdrop(backgroundBackdrop))
+        Scaffold(
+            modifier = Modifier.layerBackdrop(contentBackdrop),
+            containerColor = Color.Transparent,
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
+        ) { innerPadding ->
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding),
         ) {
+            // Include an opaque backdrop in the recorded page so empty areas refract the same canvas.
             HyperCarBackground()
             Crossfade(
                 targetState = current,
@@ -458,62 +430,41 @@ private fun MainContent(onStart: () -> Unit) {
                 }
             }
         }
-    }
-}
-
-/**
- * 顶部窄条：连接态色点 + HyperCar 字标 + 车名缩写。
- */
-@Composable
-private fun StatusStrip(link: LinkState, modifier: Modifier = Modifier) {
-    val dotColor = when (link) {
-        is LinkState.Connected -> MintGreen
-        is LinkState.Negotiating -> ElectricCyan
-        is LinkState.Failed -> CoralError
-        is LinkState.Stopping -> AmberWarning
-        is LinkState.Idle -> TextSecondary
-    }
-    val carAbbreviation = (link as? LinkState.Connected)?.carName
-        ?.uppercase()
-        ?.take(4)
-        ?: when (link) {
-            is LinkState.Negotiating -> "协商中"
-            is LinkState.Failed -> "连接失败"
-            is LinkState.Stopping -> "断开中"
-            else -> "待机"
         }
-
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .background(DeepSpace)
-            .windowInsetsPadding(WindowInsets.statusBars)
-            .padding(horizontal = 20.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(
+        // The floating bar samples the page beneath it, including scrolling cards and text.
+        CompositionLocalProvider(LocalLiquidBackdrop provides contentBackdrop) {
+        io.github.hypercar.ui.components.GlassStatusStrip(snapshot.link, Modifier.align(Alignment.TopCenter))
+        NavigationBar(
             modifier = Modifier
-                .size(8.dp)
-                .background(dotColor, CircleShape),
-        )
-        Spacer(modifier = Modifier.width(10.dp))
-        Text(
-            text = "ColorPlay Next",
-            style = MaterialTheme.typography.titleSmall.copy(
-                letterSpacing = 0.3.sp,
-            ),
-            color = TextPrimary,
-            maxLines = 1,
-        )
-        Spacer(modifier = Modifier.weight(1f))
-        Text(
-            text = carAbbreviation,
-            style = MaterialTheme.typography.labelSmall,
-            color = TextSecondary,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp, vertical = 12.dp)
+                .glassPanel(cornerRadius = 32.dp),
+            containerColor = Color.Transparent,
+            tonalElevation = 0.dp,
+            windowInsets = WindowInsets(0, 0, 0, 0),
+        ) {
+            tabs.forEachIndexed { index, tab ->
+                NavigationBarItem(
+                    selected = tabIndex == index,
+                    onClick = { tabIndex = index },
+                    icon = { Icon(tab.icon, tab.title, Modifier.size(22.dp)) },
+                    label = { Text(tab.title, style = MaterialTheme.typography.labelSmall, maxLines = 1) },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = ElectricCyan,
+                        selectedTextColor = ElectricCyan,
+                        unselectedIconColor = TextSecondary,
+                        unselectedTextColor = TextSecondary,
+                        indicatorColor = ElectricCyan.copy(alpha = 0.14f),
+                    ),
+                )
+            }
+        }
+        }
+    }
     }
 }
+
+// The fork-owned header is isolated in components/GlassStatusStrip.kt.
 
 

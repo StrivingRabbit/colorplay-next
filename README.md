@@ -4,12 +4,20 @@ Android 原生 Compose 应用，基于 [HyperCar](https://github.com/fw867/hyper
 
 ## 本分支状态
 
-- 应用包名 `com.emxxme.colorplaynext`；沿用旧版签名材料与图标，版本 `0.2.0/200`。签名私钥及配置不入库。
-- Android 原生 Compose，不引入跨平台构建；当前玻璃拟态组件并非 AndroidLiquidGlass/Backdrop 的真实折射效果。
+- 应用包名 `com.emxxme.colorplaynext`；沿用旧版签名材料与图标，版本 `0.2.2/202`。签名私钥及配置不入库。
+- Android 原生 Compose，不引入跨平台构建；集成 AndroidLiquidGlass 的 Backdrop 1.0.0 背景采样、模糊及镜头折射，底栏为页面上的独立浮层，顶部为背景模糊并沿下缘渐隐的玻璃浮层。页面背景、内容分别录制，避免采样自身。卡片采用低染色和弱细描边，避免厚重亚克力感。
 - OPPO 源仅在启动阶段持续拒连、Shizuku 可用、当前会话仍有效时有界拉起 `com.oplus.ocar/.CarlifeActivity`；已经连接的源不重开。保留其他系统 CarLife+ 的手动入口。
 - 导航、音乐、触摸、方向盘按键及自动重连沿用上游实现；一加16、原厂无线接收端与盒子的实际闭环仍需逐项真机验证，不宣称全部已兼容。
 - OPPO 组件与时序经验参考本地 ColorPlay 实测；协议研究参考 [CarDeck](https://github.com/shaonialife/cardeck)。未合入 ColorPlay 反编译主体或厂商密钥。
 - 本衍生版本遵循 GPL-3.0，保留上游历史和许可。以下保留上游使用说明，涉及 HyperCar 品牌、平台验证与发布地址的内容属于上游说明，不代表本分支验收。
+
+## 底座维护
+
+- 已导入 HyperCar `0.1.0.632 / 10728`，提交 `02dd679b23bf8635aa07a4dbd1e80d530f19f1af`；`app/src/main/java/io/github/hypercar/UpstreamBase.kt` 是关于页底座信息的单点来源。
+- 本地 `upstream` 远端指向 `https://github.com/fw867/hypercar.git`；新克隆需执行 `git remote add upstream https://github.com/fw867/hypercar.git`。保留原历史，不以覆盖文件方式更新底座。
+- 审计入口：`python3 tools/check-hypercar-base.py --fetch` 校验已导入版本、读取上游更新及本分支差异，只 fetch/比较，不自动合并、改底座记录或发布。离线核查可用 `--target <已知提交>`。
+- 升级顺序：干净工作区 → `git fetch upstream main` → 对比 `UpstreamBase.COMMIT..upstream/main` → 在独立升级分支合并 → 审查 OPPO / UI 接入冲突 → JVM、原生、Release Lint 和真机回归 → 更新底座记录并用原证书发布。fetch 失败时不更新底座记录。
+- 尽可能将定制封装在独立文件；必须修改的会话接入点保持小范围，不能保证完全无冲突。应用内“检查更新”只检查 ColorPlay Next APK，不直接替换底座、不安装 HyperCar APK。
 
 ## 上游 HyperCar 说明
 

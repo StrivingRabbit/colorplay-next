@@ -43,6 +43,8 @@ import io.github.hypercar.session.GitHubFeedback
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.ui.components.CapsuleButton
 import io.github.hypercar.ui.components.GlassPanel
+import io.github.hypercar.ui.components.floatingChromeBottomPadding
+import io.github.hypercar.ui.components.floatingChromeTopPadding
 import io.github.hypercar.ui.components.SectionLabel
 import io.github.hypercar.ui.theme.AmberWarning
 import io.github.hypercar.ui.theme.CoralError
@@ -82,6 +84,7 @@ fun DiagnosticsScreen(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        Spacer(modifier = Modifier.height(floatingChromeTopPadding()))
         Header(
             count = logs.size,
             recording = recording,
@@ -318,6 +321,7 @@ private fun LogList(logs: List<String>, modifier: Modifier = Modifier) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f),
+                contentPadding = PaddingValues(bottom = floatingChromeBottomPadding()),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 // 反转显示：最新日志在最上方

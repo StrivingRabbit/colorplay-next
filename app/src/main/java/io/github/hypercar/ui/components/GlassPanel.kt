@@ -3,7 +3,25 @@ package io.github.hypercar.ui.components
 import android.graphics.BlurMaskFilter
 import android.graphics.Paint
 import android.graphics.RectF
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.shape.CornerBasedShape
+import androidx.compose.material3.minimumInteractiveComponentSize
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.semantics.disabled
+import androidx.compose.ui.state.ToggleableState
+import com.kyant.backdrop.Backdrop
+import com.kyant.backdrop.drawBackdrop
+import com.kyant.backdrop.effects.blur
+import com.kyant.backdrop.effects.lens
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -17,7 +35,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -26,7 +43,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.Brush
@@ -41,13 +57,40 @@ import io.github.hypercar.ui.theme.DeepSpace
 import io.github.hypercar.ui.theme.ElectricCyan
 import io.github.hypercar.ui.theme.LocalGlass
 
-/**
- * 玻璃拟态表面 Modifier：
- * 半透面板填充 + 1px 渐变描边 + 圆角（默认 20dp）+ 可选外辉光。
- * 不带内容，只负责“面”；内容用 [GlassPanel] 或直接叠加。
- * 当前仅绘制拟态表面；后续 Android 13+ 的 RuntimeShader / RenderEffect
- * 或 Backdrop 适配集中在此处，须先接入内容背景采样，不能对整张卡片直接模糊。
- */
+/** 由根布局提供已录制的背景；玻璃组件不得录制进自己正在采样的同一层。 */
+val LocalLiquidBackdrop = staticCompositionLocalOf<Backdrop?> { null }
+
+/** 仅对采样背景施加模糊和 AGSL 折射，后续绘制的文字、图标保持清晰。 */
+@Composable
+fun Modifier.liquidGlassSurface(
+    shape: CornerBasedShape,
+    tint: Color,
+    blurRadius: Dp = 8.dp,
+    refractionHeight: Dp = 6.dp,
+    refractionAmount: Dp = 4.dp,
+): Modifier {
+    val backdrop = LocalLiquidBackdrop.current
+    return if (backdrop != null) {
+        drawBackdrop(
+            backdrop = backdrop,
+            shape = { shape },
+            effects = {
+                blur(blurRadius.toPx())
+                lens(
+                    refractionHeight = refractionHeight.toPx(),
+                    refractionAmount = refractionAmount.toPx(),
+                    chromaticAberration = false,
+                )
+            },
+            onDrawSurface = { drawRect(tint) },
+        )
+    } else {
+        // 独立预览未提供采样层时，仍保留可读的透明表面。
+        background(tint, shape)
+    }
+}
+
+/** AndroidLiquidGlass 背景采样表面，可选外辉光。 */
 @Composable
 fun Modifier.glassPanel(
     cornerRadius: Dp = LocalGlass.current.cornerRadius,
@@ -61,9 +104,9 @@ fun Modifier.glassPanel(
     val strokeBrush = remember(glass, cornerRadius, accent, dark) {
         Brush.verticalGradient(
             listOf(
-                if (dark) Color.White.copy(alpha = 0.32f) else glass.strokeColor,
-                glass.strokeColor.copy(alpha = 0.5f),
-                if (dark) accent.copy(alpha = 0.16f) else glass.strokeColor,
+                if (dark) Color.White.copy(alpha = 0.08f) else glass.strokeColor.copy(alpha = 0.08f),
+                glass.strokeColor.copy(alpha = 0.04f),
+                if (dark) accent.copy(alpha = 0.03f) else glass.strokeColor.copy(alpha = 0.04f),
             ),
         )
     }
@@ -76,12 +119,12 @@ fun Modifier.glassPanel(
     }
     val glowModifier = if (glow && dark) {
         Modifier.drawWithCache {
-            val strokeWidthPx = 2.dp.toPx()
+            val strokeWidthPx = 0.5.dp.toPx()
             val radiusPx = cornerRadius.toPx()
             glowPaint.strokeWidth = strokeWidthPx
             glowPaint.maskFilter = BlurMaskFilter(radiusPx * 1.25f, BlurMaskFilter.Blur.NORMAL)
             // android.graphics.Paint.color 是 ARGB Int，需把 Compose Color 转过去
-            glowPaint.color = glowColor.copy(alpha = 0.28f).toArgb()
+            glowPaint.color = glowColor.copy(alpha = 0.08f).toArgb()
             onDrawBehind {
                 // 带 BlurMaskFilter 的辉光必须走 nativeCanvas（Compose 的 drawRoundRect 不接 Paint）
                 drawIntoCanvas { canvas ->
@@ -101,13 +144,15 @@ fun Modifier.glassPanel(
     }
     return this
         .then(glowModifier)
-        .shadow(if (dark) 12.dp else 2.dp, shape, clip = false)
+        .liquidGlassSurface(
+            shape = shape,
+            tint = if (dark) Color(0xFF142238).copy(alpha = 0.10f) else Color.White.copy(alpha = 0.10f),
+        )
         .clip(shape)
-        .background(glass.panelBrush)
         .border(glass.strokeWidth, strokeBrush, shape)
 }
 
-/** 玻璃拟态卡片：半透背景 + 1px 描边 + 圆角 20dp + 可选辉光，内容统一 20dp 内边距。 */
+/** 背景折射卡片，内容统一 20dp 内边距。 */
 @Composable
 fun GlassPanel(
     modifier: Modifier = Modifier,
@@ -137,11 +182,8 @@ fun SectionLabel(text: String, modifier: Modifier = Modifier) {
 
 /**
  * 胶囊按钮（主按钮全宽 52dp，最小触达 44dp）：
- * [filled] = true 电光青实心；false 描边（用于停止 / 断开等次要动作）。
- *
- * 文字颜色默认值随 [filled] 自动切换：实心用深空色（压在亮底上），
- * 描边用 [containerColor]（压在深色背景上）。此前默认恒为 `DeepSpace`，
- * 描边按钮没有底色时就是「深色字 + 深色背景」——字直接看不见。
+ * [filled] = true 使用强调色玻璃；false 使用轻染色玻璃（停止 / 断开等次要动作）。
+ * 深色模式用强调色文字，浅色强调按钮用深色文字，保证折射背景上的可读性。
  */
 @Composable
 fun CapsuleButton(
@@ -162,7 +204,7 @@ fun CapsuleButton(
 ) {
     val shape = RoundedCornerShape(24.dp)
     val resolvedContent = if (contentColor == Color.Unspecified) {
-        if (filled) DeepSpace else containerColor
+        if (filled && !io.github.hypercar.ui.theme.LocalAppPalette.current.dark) DeepSpace else containerColor
     } else {
         contentColor
     }
@@ -173,31 +215,21 @@ fun CapsuleButton(
     Row(
         modifier = modifier
             .heightIn(min = 52.dp)
-            .clip(shape)
-            .then(
-                if (filled) {
-                    Modifier.background(
-                        Brush.verticalGradient(
-                            listOf(containerColor.copy(alpha = opacity), containerColor.copy(alpha = 0.75f * opacity)),
-                        ),
-                    )
-                } else {
-                    Modifier.background(
-                        Brush.verticalGradient(
-                            listOf(
-                                Color.White.copy(alpha = if (dark) 0.10f else 0.6f),
-                                containerColor.copy(alpha = 0.04f),
-                            ),
-                        ),
-                    )
-                },
+            .liquidGlassSurface(
+                shape = shape,
+                tint = if (filled) containerColor.copy(alpha = 0.16f * opacity)
+                    else Color.White.copy(alpha = (if (dark) 0.04f else 0.10f) * opacity),
+                blurRadius = 4.dp,
+                refractionHeight = 4.dp,
+                refractionAmount = 3.dp,
             )
+            .clip(shape)
             .border(
-                width = 1.dp,
+                width = 0.5.dp,
                 brush = Brush.verticalGradient(
                     listOf(
-                        if (filled) Color.White.copy(alpha = 0.55f * opacity) else borderTint.copy(alpha = 0.5f),
-                        borderTint.copy(alpha = 0.12f),
+                        if (filled) Color.White.copy(alpha = 0.08f * opacity) else borderTint.copy(alpha = 0.08f * opacity),
+                        borderTint.copy(alpha = 0.04f * opacity),
                     ),
                 ),
                 shape = shape,
@@ -224,7 +256,7 @@ fun CapsuleButton(
         )
     }
 }
-/** 保留原生开关的语义和触摸区域，渐变高光仅用于轻量玻璃拟态，并非 Backdrop 折射。 */
+/** 轨道与滑块分别折射背景，保留 Switch 无障碍语义及最小触摸区域。 */
 @Composable
 fun GlassSwitch(
     checked: Boolean,
@@ -233,26 +265,58 @@ fun GlassSwitch(
     enabled: Boolean = true,
     colors: androidx.compose.material3.SwitchColors = androidx.compose.material3.SwitchDefaults.colors(),
 ) {
-    androidx.compose.material3.Switch(
-        checked = checked,
-        onCheckedChange = onCheckedChange,
-        enabled = enabled,
-        colors = colors,
-        modifier = modifier.drawWithCache {
-            val highlight = Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.18f), Color.Transparent))
-            onDrawWithContent {
-                drawContent()
-                val trackHeight = 30.dp.toPx()
-                val trackWidth = 50.dp.toPx()
-                drawRoundRect(
-                    brush = highlight,
-                    topLeft = androidx.compose.ui.geometry.Offset((size.width - trackWidth) / 2, (size.height - trackHeight) / 2),
-                    size = androidx.compose.ui.geometry.Size(trackWidth, trackHeight),
-                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(trackHeight / 2),
-                )
-            }
-        },
-    )
+    val thumbOffset by animateDpAsState(if (checked) 26.dp else 4.dp, label = "玻璃开关滑块")
+    val trackColor = if (enabled) {
+        if (checked) colors.checkedTrackColor else colors.uncheckedTrackColor
+    } else {
+        if (checked) colors.disabledCheckedTrackColor else colors.disabledUncheckedTrackColor
+    }
+    val thumbColor = if (enabled) {
+        if (checked) colors.checkedThumbColor else colors.uncheckedThumbColor
+    } else {
+        if (checked) colors.disabledCheckedThumbColor else colors.disabledUncheckedThumbColor
+    }
+    Box(
+        modifier = modifier
+            .then(
+                if (onCheckedChange != null) Modifier.toggleable(
+                    value = checked,
+                    enabled = enabled,
+                    role = Role.Switch,
+                    onValueChange = onCheckedChange,
+                ) else Modifier.semantics {
+                    role = Role.Switch
+                    toggleableState = ToggleableState(checked)
+                    if (!enabled) disabled()
+                },
+            )
+            .minimumInteractiveComponentSize(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            Modifier.size(width = 58.dp, height = 34.dp)
+                .liquidGlassSurface(
+                    shape = RoundedCornerShape(50),
+                    tint = trackColor.copy(alpha = if (checked) 0.5f else 0.22f),
+                    blurRadius = 3.dp,
+                    refractionHeight = 3.dp,
+                    refractionAmount = 2.dp,
+                ),
+        ) {
+            Box(
+                Modifier.align(Alignment.CenterStart)
+                    .offset(x = thumbOffset)
+                    .size(28.dp)
+                    .liquidGlassSurface(
+                        shape = RoundedCornerShape(50),
+                        tint = thumbColor.copy(alpha = 0.62f),
+                        blurRadius = 1.dp,
+                        refractionHeight = 3.dp,
+                        refractionAmount = 2.dp,
+                    ),
+            )
+        }
+    }
 }
 
 /** 状态小圆点（统计芯片 / 状态条用）。 */

@@ -26,6 +26,8 @@ import io.github.hypercar.core.SessionSnapshot
 import io.github.hypercar.perm.PermGroup
 import io.github.hypercar.perm.PermissionSummary
 import io.github.hypercar.ui.components.GlassPanel
+import io.github.hypercar.ui.components.floatingChromeBottomPadding
+import io.github.hypercar.ui.components.floatingChromeTopPadding
 import io.github.hypercar.ui.components.PermissionChecklistCard
 import io.github.hypercar.ui.components.StatGrid
 import io.github.hypercar.ui.components.StatusHeroCard
@@ -102,16 +104,18 @@ fun HomeScreen(
             Row(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 20.dp, vertical = 16.dp),
+                    .padding(horizontal = 20.dp),
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 Column(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxHeight()
-                        .verticalScroll(rememberScrollState()),
+                        .verticalScroll(rememberScrollState())
+                        .padding(vertical = 16.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
+                    Spacer(modifier = Modifier.height(floatingChromeTopPadding()))
                     Setup()
                     StatusHeroCard(
                         startEnabled = startup.manualReady && selection.profile != null,
@@ -131,20 +135,23 @@ fun HomeScreen(
                         onOpenShizuku = onOpenShizukuSettings,
                         degradedHint = degradedChipHint(snapshot),
                     )
+                    Spacer(modifier = Modifier.height(floatingChromeBottomPadding()))
                 }
                 Column(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxHeight()
-                        .verticalScroll(rememberScrollState()),
+                        .verticalScroll(rememberScrollState())
+                        .padding(vertical = 16.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
+                    Spacer(modifier = Modifier.height(floatingChromeTopPadding()))
                     if (startup.manualReady) Checklist()
                     if (snapshot.link is io.github.hypercar.core.LinkState.Connected) {
                         ConnectionStageCard(snapshot.pipeline.takeIf { it.active }
                             ?: io.github.hypercar.core.PipelineDiagnostics())
                     } else FirstConnectGuideCard()
-
+                    Spacer(modifier = Modifier.height(floatingChromeBottomPadding()))
                 }
             }
         } else {
@@ -155,6 +162,7 @@ fun HomeScreen(
                     .padding(horizontal = 16.dp, vertical = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
+                Spacer(modifier = Modifier.height(floatingChromeTopPadding()))
                 Setup()
                 // 第一张卡：实时步骤（Negotiating 时显示 link.step）
                 StatusHeroCard(
@@ -182,7 +190,7 @@ fun HomeScreen(
                         ?: io.github.hypercar.core.PipelineDiagnostics())
                 } else FirstConnectGuideCard()
 
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(floatingChromeBottomPadding()))
             }
         }
     }
