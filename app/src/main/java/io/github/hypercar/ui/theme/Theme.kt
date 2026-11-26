@@ -77,6 +77,7 @@ private fun glassFor(p: AppPalette) = GlassSpecs(
 val LocalGradients = staticCompositionLocalOf { gradientsFor(DarkAppPalette) }
 val LocalGlass = staticCompositionLocalOf { glassFor(DarkAppPalette) }
 
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun HyperCarTheme(
     mode: AppThemeMode = AppThemeMode.Dark,
@@ -127,6 +128,8 @@ fun HyperCarTheme(
         LocalAppPalette provides p,
         LocalGradients provides gradients,
         LocalGlass provides glass,
+        androidx.compose.foundation.LocalIndication provides io.github.hypercar.ui.components.GlassPressIndication,
+        androidx.compose.material3.LocalRippleConfiguration provides null,
     ) {
         MaterialTheme(colorScheme = colorScheme, typography = HyperCarTypography, content = content)
     }

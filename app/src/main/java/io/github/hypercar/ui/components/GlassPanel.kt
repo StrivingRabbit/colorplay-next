@@ -1,6 +1,11 @@
 package io.github.hypercar.ui.components
 
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.runtime.remember
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.offset
@@ -60,8 +65,8 @@ fun Modifier.liquidGlassSurface(
     shape: CornerBasedShape,
     tint: Color,
     blurRadius: Dp = 4.dp,
-    refractionHeight: Dp = 12.dp,
-    refractionAmount: Dp = 16.dp,
+    refractionHeight: Dp = 14.dp,
+    refractionAmount: Dp = 20.dp,
 ): Modifier {
     val backdrop = LocalLiquidBackdrop.current
     return if (backdrop != null) {
@@ -209,6 +214,9 @@ fun GlassSwitch(
     enabled: Boolean = true,
     colors: androidx.compose.material3.SwitchColors = androidx.compose.material3.SwitchDefaults.colors(),
 ) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val pressScale by animateFloatAsState(if (pressed) 0.94f else 1f, label = "switch-press")
     val thumbOffset by animateDpAsState(if (checked) 26.dp else 4.dp, label = "玻璃开关滑块")
     val trackColor = if (enabled) {
         if (checked) colors.checkedTrackColor else colors.uncheckedTrackColor
@@ -227,6 +235,8 @@ fun GlassSwitch(
                     value = checked,
                     enabled = enabled,
                     role = Role.Switch,
+                    interactionSource = interaction,
+                    indication = null,
                     onValueChange = onCheckedChange,
                 ) else Modifier.semantics {
                     role = Role.Switch
@@ -239,9 +249,10 @@ fun GlassSwitch(
     ) {
         Box(
             Modifier.size(width = 58.dp, height = 34.dp)
+                .graphicsLayer { scaleX = pressScale; scaleY = pressScale }
                 .liquidGlassSurface(
                     shape = RoundedCornerShape(50),
-                    tint = trackColor.copy(alpha = if (checked) 0.28f else 0.12f),
+                    tint = trackColor.copy(alpha = if (!enabled) 0.16f else if (checked) 0.78f else 0.20f),
                     blurRadius = 2.dp,
                     refractionHeight = 6.dp,
                     refractionAmount = 8.dp,
@@ -253,7 +264,7 @@ fun GlassSwitch(
                     .size(28.dp)
                     .liquidGlassSurface(
                         shape = RoundedCornerShape(50),
-                        tint = thumbColor.copy(alpha = 0.24f),
+                        tint = (if (checked) Color(0xFFF4FCFF) else Color(0xFFC1CFDC)).copy(alpha = if (enabled) 0.96f else 0.44f),
                         blurRadius = 1.dp,
                         refractionHeight = 5.dp,
                         refractionAmount = 6.dp,

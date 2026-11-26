@@ -3,6 +3,9 @@ package io.github.hypercar.ui.components
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -90,7 +93,7 @@ fun LiquidBottomTabs(
                 effects = {
                     vibrancy()
                     blur(4.dp.toPx())
-                    lens(24.dp.toPx(), 24.dp.toPx())
+                    lens(26.dp.toPx(), 30.dp.toPx())
                 },
                 highlight = { Highlight(width = 0.7.dp, blurRadius = 1.dp, alpha = 0.45f,
                     style = HighlightStyle.Default(intensity = 0.30f, angle = 60f, falloff = 2f)) },
@@ -144,10 +147,16 @@ fun LiquidBottomTabs(
         ) {
             items.forEachIndexed { index, item ->
                 val active = index == safeIndex
+                val interaction = remember { MutableInteractionSource() }
+                val pressed by interaction.collectIsPressedAsState()
+                val itemScale by animateFloatAsState(if (pressed) 0.93f else 1f, spring(), label = "tab-press-$index")
                 val tint = if (active) ElectricCyan else TextSecondary
                 Column(
                     Modifier.weight(1f).fillMaxHeight()
-                        .selectable(selected = active, role = Role.Tab, onClick = { latestSelect(index) }),
+                        .graphicsLayer { scaleX = itemScale; scaleY = itemScale }
+                        .clip(shape)
+                        .selectable(selected = active, role = Role.Tab, interactionSource = interaction,
+                            indication = null, onClick = { latestSelect(index) }),
                     verticalArrangement = Arrangement.Center,
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {

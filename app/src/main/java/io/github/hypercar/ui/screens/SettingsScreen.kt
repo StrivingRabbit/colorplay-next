@@ -145,7 +145,7 @@ fun SettingsScreen(
         Spacer(Modifier.height(floatingChromeTopPadding()))
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             if (page != SettingsPage.Main) {
-                TextButton(onClick = { open(page.parent) }) { Text("‹ 返回", color = ElectricCyan) }
+                io.github.hypercar.ui.components.GlassBackButton(onClick = { open(page.parent) })
                 Spacer(Modifier.width(8.dp))
             }
             Text(page.title, color = TextPrimary, style = MaterialTheme.typography.titleLarge,

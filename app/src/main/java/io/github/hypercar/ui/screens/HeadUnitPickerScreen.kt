@@ -3,6 +3,7 @@ package io.github.hypercar.ui.screens
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -106,10 +107,11 @@ internal fun HeadUnitPickerScreen(connected: Boolean, modifier: Modifier = Modif
         modifier.fillMaxSize().imePadding().padding(horizontal = 16.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        androidx.compose.foundation.layout.Spacer(Modifier.height(io.github.hypercar.ui.components.floatingChromeTopPadding()))
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = ::back) { Text("‹ 返回", color = ElectricCyan) }
+            io.github.hypercar.ui.components.GlassBackButton(onClick = ::back)
             Text("选择车机档案", color = TextPrimary, style = MaterialTheme.typography.titleLarge,
-                modifier = Modifier.weight(1f))
+                modifier = Modifier.weight(1f).padding(start = 12.dp))
             TextButton(enabled = !refreshing, onClick = {
                 refreshing = true
                 message = null

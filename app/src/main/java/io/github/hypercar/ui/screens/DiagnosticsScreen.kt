@@ -293,7 +293,7 @@ private fun LogList(logs: List<String>, modifier: Modifier = Modifier) {
     }
     GlassPanel(
         modifier = modifier,
-        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 20.dp),
     ) {
         if (logs.isEmpty()) {
             Column(
