@@ -1,8 +1,5 @@
 package io.github.hypercar.ui.components
 
-import android.graphics.BlurMaskFilter
-import android.graphics.Paint
-import android.graphics.RectF
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
@@ -22,8 +19,8 @@ import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
+import com.kyant.backdrop.effects.vibrancy
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -40,16 +37,10 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawWithCache
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
-import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -65,16 +56,20 @@ val LocalLiquidBackdrop = staticCompositionLocalOf<Backdrop?> { null }
 fun Modifier.liquidGlassSurface(
     shape: CornerBasedShape,
     tint: Color,
-    blurRadius: Dp = 8.dp,
-    refractionHeight: Dp = 6.dp,
-    refractionAmount: Dp = 4.dp,
+    blurRadius: Dp = 4.dp,
+    refractionHeight: Dp = 12.dp,
+    refractionAmount: Dp = 16.dp,
 ): Modifier {
     val backdrop = LocalLiquidBackdrop.current
     return if (backdrop != null) {
         drawBackdrop(
             backdrop = backdrop,
             shape = { shape },
+            highlight = null,
+            shadow = null,
+            innerShadow = null,
             effects = {
+                vibrancy()
                 blur(blurRadius.toPx())
                 lens(
                     refractionHeight = refractionHeight.toPx(),
@@ -90,66 +85,21 @@ fun Modifier.liquidGlassSurface(
     }
 }
 
-/** AndroidLiquidGlass 背景采样表面，可选外辉光。 */
+/** 无描边的背景折射表面；glow、glowColor 仅为兼容现有调用保留，不再绘制辉光。 */
 @Composable
 fun Modifier.glassPanel(
     cornerRadius: Dp = LocalGlass.current.cornerRadius,
     glow: Boolean = false,
     glowColor: Color = LocalGlass.current.glowColor,
 ): Modifier {
-    val glass = LocalGlass.current
     val dark = io.github.hypercar.ui.theme.LocalAppPalette.current.dark
-    val accent = ElectricCyan
     val shape = RoundedCornerShape(cornerRadius)
-    val strokeBrush = remember(glass, cornerRadius, accent, dark) {
-        Brush.verticalGradient(
-            listOf(
-                if (dark) Color.White.copy(alpha = 0.08f) else glass.strokeColor.copy(alpha = 0.08f),
-                glass.strokeColor.copy(alpha = 0.04f),
-                if (dark) accent.copy(alpha = 0.03f) else glass.strokeColor.copy(alpha = 0.04f),
-            ),
-        )
-    }
-    val glowPaint = remember {
-        Paint().apply {
-            style = Paint.Style.STROKE
-            strokeJoin = Paint.Join.ROUND
-            strokeCap = Paint.Cap.ROUND
-        }
-    }
-    val glowModifier = if (glow && dark) {
-        Modifier.drawWithCache {
-            val strokeWidthPx = 0.5.dp.toPx()
-            val radiusPx = cornerRadius.toPx()
-            glowPaint.strokeWidth = strokeWidthPx
-            glowPaint.maskFilter = BlurMaskFilter(radiusPx * 1.25f, BlurMaskFilter.Blur.NORMAL)
-            // android.graphics.Paint.color 是 ARGB Int，需把 Compose Color 转过去
-            glowPaint.color = glowColor.copy(alpha = 0.08f).toArgb()
-            onDrawBehind {
-                // 带 BlurMaskFilter 的辉光必须走 nativeCanvas（Compose 的 drawRoundRect 不接 Paint）
-                drawIntoCanvas { canvas ->
-                    val inset = strokeWidthPx / 2f
-                    val rect = RectF(
-                        inset,
-                        inset,
-                        size.width - inset,
-                        size.height - inset,
-                    )
-                    canvas.nativeCanvas.drawRoundRect(rect, radiusPx, radiusPx, glowPaint)
-                }
-            }
-        }
-    } else {
-        Modifier
-    }
     return this
-        .then(glowModifier)
         .liquidGlassSurface(
             shape = shape,
             tint = if (dark) Color(0xFF142238).copy(alpha = 0.10f) else Color.White.copy(alpha = 0.10f),
         )
         .clip(shape)
-        .border(glass.strokeWidth, strokeBrush, shape)
 }
 
 /** 背景折射卡片，内容统一 20dp 内边距。 */
@@ -194,7 +144,7 @@ fun CapsuleButton(
     filled: Boolean = true,
     containerColor: Color = ElectricCyan,
     contentColor: Color = Color.Unspecified,
-    borderColor: Color = ElectricCyan,
+    borderColor: Color = ElectricCyan, // 兼容现有调用，不再绘制描边。
     leadingIcon: ImageVector? = null,
     /**
      * 左右内边距。默认 20dp；**四等分一行的窄按钮要传小值**
@@ -209,7 +159,6 @@ fun CapsuleButton(
         contentColor
     }
     val tint = resolvedContent.copy(alpha = if (enabled) 1f else 0.4f)
-    val borderTint = borderColor.copy(alpha = if (enabled) borderColor.alpha else borderColor.alpha * 0.4f)
     val dark = io.github.hypercar.ui.theme.LocalAppPalette.current.dark
     val opacity = if (enabled) 1f else 0.35f
     Row(
@@ -220,20 +169,10 @@ fun CapsuleButton(
                 tint = if (filled) containerColor.copy(alpha = 0.16f * opacity)
                     else Color.White.copy(alpha = (if (dark) 0.04f else 0.10f) * opacity),
                 blurRadius = 4.dp,
-                refractionHeight = 4.dp,
-                refractionAmount = 3.dp,
+                refractionHeight = 6.dp,
+                refractionAmount = 8.dp,
             )
             .clip(shape)
-            .border(
-                width = 0.5.dp,
-                brush = Brush.verticalGradient(
-                    listOf(
-                        if (filled) Color.White.copy(alpha = 0.08f * opacity) else borderTint.copy(alpha = 0.08f * opacity),
-                        borderTint.copy(alpha = 0.04f * opacity),
-                    ),
-                ),
-                shape = shape,
-            )
             .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = horizontalPadding),
         horizontalArrangement = Arrangement.Center,
@@ -297,10 +236,10 @@ fun GlassSwitch(
             Modifier.size(width = 58.dp, height = 34.dp)
                 .liquidGlassSurface(
                     shape = RoundedCornerShape(50),
-                    tint = trackColor.copy(alpha = if (checked) 0.5f else 0.22f),
-                    blurRadius = 3.dp,
-                    refractionHeight = 3.dp,
-                    refractionAmount = 2.dp,
+                    tint = trackColor.copy(alpha = if (checked) 0.28f else 0.12f),
+                    blurRadius = 2.dp,
+                    refractionHeight = 6.dp,
+                    refractionAmount = 8.dp,
                 ),
         ) {
             Box(
@@ -309,10 +248,10 @@ fun GlassSwitch(
                     .size(28.dp)
                     .liquidGlassSurface(
                         shape = RoundedCornerShape(50),
-                        tint = thumbColor.copy(alpha = 0.62f),
+                        tint = thumbColor.copy(alpha = 0.24f),
                         blurRadius = 1.dp,
-                        refractionHeight = 3.dp,
-                        refractionAmount = 2.dp,
+                        refractionHeight = 5.dp,
+                        refractionAmount = 6.dp,
                     ),
             )
         }

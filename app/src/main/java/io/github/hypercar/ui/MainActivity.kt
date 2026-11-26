@@ -358,7 +358,10 @@ private fun MainContent(onStart: () -> Unit) {
     val backgroundBackdrop = rememberLayerBackdrop()
     val contentBackdrop = rememberLayerBackdrop()
     // ColorPlay Next chrome: two one-way sampled layers keep the fork's glass separate from session logic.
-    CompositionLocalProvider(LocalLiquidBackdrop provides backgroundBackdrop) {
+    CompositionLocalProvider(
+        LocalLiquidBackdrop provides backgroundBackdrop,
+        io.github.hypercar.ui.components.LocalOverlayBackdrop provides contentBackdrop,
+    ) {
     Box(Modifier.fillMaxSize()) {
         // Record only the background for page glass; never record a component into its own source.
         HyperCarBackground(Modifier.layerBackdrop(backgroundBackdrop))
@@ -434,32 +437,14 @@ private fun MainContent(onStart: () -> Unit) {
         // The floating bar samples the page beneath it, including scrolling cards and text.
         CompositionLocalProvider(LocalLiquidBackdrop provides contentBackdrop) {
         io.github.hypercar.ui.components.GlassStatusStrip(snapshot.link, Modifier.align(Alignment.TopCenter))
-        NavigationBar(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
-                .padding(horizontal = 20.dp, vertical = 12.dp)
-                .glassPanel(cornerRadius = 32.dp),
-            containerColor = Color.Transparent,
-            tonalElevation = 0.dp,
-            windowInsets = WindowInsets(0, 0, 0, 0),
-        ) {
-            tabs.forEachIndexed { index, tab ->
-                NavigationBarItem(
-                    selected = tabIndex == index,
-                    onClick = { tabIndex = index },
-                    icon = { Icon(tab.icon, tab.title, Modifier.size(22.dp)) },
-                    label = { Text(tab.title, style = MaterialTheme.typography.labelSmall, maxLines = 1) },
-                    colors = NavigationBarItemDefaults.colors(
-                        selectedIconColor = ElectricCyan,
-                        selectedTextColor = ElectricCyan,
-                        unselectedIconColor = TextSecondary,
-                        unselectedTextColor = TextSecondary,
-                        indicatorColor = ElectricCyan.copy(alpha = 0.14f),
-                    ),
-                )
-            }
-        }
+        io.github.hypercar.ui.components.LiquidBottomTabs(
+            items = tabs.map { io.github.hypercar.ui.components.LiquidTabItem(it.title, it.icon) },
+            selectedIndex = tabIndex,
+            onSelected = { tabIndex = it },
+            backdrop = contentBackdrop,
+            modifier = Modifier.align(Alignment.BottomCenter)
+                .navigationBarsPadding().padding(horizontal = 20.dp, vertical = 12.dp),
+        )
         }
     }
     }

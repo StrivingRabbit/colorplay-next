@@ -102,9 +102,7 @@ private fun StatChip(
     Row(
         modifier = modifier
             .heightIn(min = 52.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(SurfaceInset.copy(alpha = 0.65f))
-            .border(1.dp, StrokeGlass, RoundedCornerShape(16.dp))
+            .glassPanel(cornerRadius = 16.dp)
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(horizontal = 10.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,

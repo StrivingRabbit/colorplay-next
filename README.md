@@ -4,8 +4,8 @@ Android 原生 Compose 应用，基于 [HyperCar](https://github.com/fw867/hyper
 
 ## 本分支状态
 
-- 应用包名 `com.emxxme.colorplaynext`；沿用旧版签名材料与图标，版本 `0.2.2/202`。签名私钥及配置不入库。
-- Android 原生 Compose，不引入跨平台构建；集成 AndroidLiquidGlass 的 Backdrop 1.0.0 背景采样、模糊及镜头折射，底栏为页面上的独立浮层，顶部为背景模糊并沿下缘渐隐的玻璃浮层。页面背景、内容分别录制，避免采样自身。卡片采用低染色和弱细描边，避免厚重亚克力感。
+- 应用包名 `com.emxxme.colorplaynext`；沿用旧版签名材料与图标，版本 `0.2.3/203`。签名私钥及配置不入库。
+- Android 原生 Compose，不引入跨平台构建；集成 AndroidLiquidGlass 的 Backdrop 1.0.0 背景采样、模糊及镜头折射，底栏为页面上的独立浮层，顶部为背景模糊并沿下缘渐隐的玻璃浮层。页面背景、内容分别录制，避免采样自身。显式关闭库默认高光与阴影并移除额外描边，改用振色、模糊和背景镜头折射；底栏为独立 LiquidBottomTabs，带弹簧移动的折射指示器，支持点选与横向拖动。
 - OPPO 源仅在启动阶段持续拒连、Shizuku 可用、当前会话仍有效时有界拉起 `com.oplus.ocar/.CarlifeActivity`；已经连接的源不重开。保留其他系统 CarLife+ 的手动入口。
 - 导航、音乐、触摸、方向盘按键及自动重连沿用上游实现；一加16、原厂无线接收端与盒子的实际闭环仍需逐项真机验证，不宣称全部已兼容。
 - OPPO 组件与时序经验参考本地 ColorPlay 实测；协议研究参考 [CarDeck](https://github.com/shaonialife/cardeck)。未合入 ColorPlay 反编译主体或厂商密钥。

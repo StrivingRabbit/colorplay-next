@@ -77,6 +77,9 @@ fun GlassStatusStrip(link: LinkState, modifier: Modifier = Modifier) {
                     .drawBackdrop(
                         backdrop = backdrop,
                         shape = { RectangleShape },
+                        highlight = null,
+                        shadow = null,
+                        innerShadow = null,
                         effects = { blur(14.dp.toPx()) },
                         onDrawSurface = { drawRect(tint) },
                     ),
