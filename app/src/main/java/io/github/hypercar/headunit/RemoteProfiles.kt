@@ -137,7 +137,7 @@ object RemoteProfiles {
 
     /** 从 [url] 拉取并落盘；返回当前版本实际应用的远程档案数。 */
     suspend fun refresh(context: Context): Int = withContext(Dispatchers.IO) {
-        val body = httpGet(context, url())
+        val body = fetchSnapshot(url()) { endpoint -> httpGet(context, endpoint) }
         // 先解析再落盘：解析不了就保持旧缓存，避免把设置页搞成空列表
         val parsed = parseSnapshot(body)
         require(parsed.profiles.isNotEmpty()) { "配置里没有任何档案" }
@@ -145,6 +145,35 @@ object RemoteProfiles {
         SettingsStore.remoteProfilesFetchedAt = System.currentTimeMillis()
         memo = body to parsed
         mergeCatalog(HeadUnitProfiles.builtin, parsed).remoteIds.size
+    }
+
+    internal const val OFFICIAL_API_URL =
+        "https://api.github.com/repos/fw867/hypercar/contents/profiles/headunits.json?ref=main"
+
+    /** Fail over only the built-in official source; never silently replace a user's custom URL. */
+    internal fun fetchSnapshot(source: String, request: (String) -> String): String {
+        try {
+            return request(source)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (primary: Exception) {
+            if (source != DEFAULT_URL) throw primary
+            try {
+                return request(OFFICIAL_API_URL)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (backup: Exception) {
+                throw java.io.IOException("官方档案源及备用接口均不可用（${failureReason(backup)}）；原档案与缓存保留", backup)
+                    .apply { addSuppressed(primary) }
+            }
+        }
+    }
+
+    internal fun failureReason(error: Throwable): String = when (error) {
+        is java.net.SocketTimeoutException -> "连接超时，请检查网络或稍后重试"
+        is java.net.UnknownHostException -> "域名解析失败，请检查 DNS 与网络"
+        is javax.net.ssl.SSLException -> "HTTPS 握手失败，请检查网络与系统时间"
+        else -> error.message?.take(180) ?: "网络请求失败"
     }
 
     private fun httpGet(
@@ -156,7 +185,8 @@ object RemoteProfiles {
         val conn = io.github.hypercar.net.InternetRoute.open(context, url).apply {
             requestMethod = "GET"
             instanceFollowRedirects = true
-            setRequestProperty("Accept", "application/json")
+            setRequestProperty("Accept", if (url == OFFICIAL_API_URL) "application/vnd.github.raw+json" else "application/json")
+            setRequestProperty("User-Agent", "ColorPlay-Next/${BuildConfig.VERSION_NAME}")
         }
         try {
             val code = conn.responseCode

@@ -149,6 +149,10 @@ class MusicNotificationListener : NotificationListenerService() {
         // Keep the system-granted listener separate from optional media work. requestUnbind
         // during an idle callback can race requestRebind and leave a bound but idle service.
         private var connected: MusicNotificationListener? = null
+        private val rebindPending = java.util.concurrent.atomic.AtomicBoolean(false)
+        private val rebindWorker = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
+            Thread(task, "music-listener-rebind").apply { isDaemon = true }
+        }
 
         private fun shouldListen() = HyperCarRepo.automaticConnectionAllowed ||
             HyperCarRepo.hasCurrentSession
@@ -181,8 +185,16 @@ class MusicNotificationListener : NotificationListenerService() {
                     connected?.ensureAttached()
                     connected?.replayNavigation()
                 } else if (MusicBridge.hasAccess(app)) {
-                    runCatching { requestRebind(ComponentName(app, MusicNotificationListener::class.java)) }
-                        .onFailure { HyperCarRepo.log("MUSIC: 恢复系统绑定失败 ${it.message}") }
+                    // requestRebind performs synchronous Binder IPC; a slow system service must not block UI.
+                    if (rebindPending.compareAndSet(false, true)) rebindWorker.execute {
+                        try {
+                            if (shouldListen()) runCatching {
+                                requestRebind(ComponentName(app, MusicNotificationListener::class.java))
+                            }.onFailure { HyperCarRepo.log("MUSIC: 恢复系统绑定失败 ${it.message}") }
+                        } finally {
+                            rebindPending.set(false)
+                        }
+                    }
                 }
             }
         }

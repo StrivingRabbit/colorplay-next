@@ -6,6 +6,46 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RemoteProfilesTest {
+    @Test fun defaultSourceUsesOfficialApiOnlyAfterPrimaryFailure() {
+        val calls = mutableListOf<String>()
+        val body = RemoteProfiles.fetchSnapshot(RemoteProfiles.DEFAULT_URL) { endpoint ->
+            calls += endpoint
+            if (endpoint == RemoteProfiles.DEFAULT_URL) throw java.net.SocketTimeoutException("timeout")
+            "{\"profiles\":[{\"id\":\"generic\"}]}"
+        }
+        assertEquals(listOf(RemoteProfiles.DEFAULT_URL, RemoteProfiles.OFFICIAL_API_URL), calls)
+        assertTrue(body.contains("profiles"))
+    }
+
+    @Test fun successfulPrimaryDoesNotRequestBackup() {
+        val calls = mutableListOf<String>()
+        assertEquals("snapshot", RemoteProfiles.fetchSnapshot(RemoteProfiles.DEFAULT_URL) { calls += it; "snapshot" })
+        assertEquals(listOf(RemoteProfiles.DEFAULT_URL), calls)
+    }
+
+    @Test fun customSourceIsNeverReplacedWithOfficialSource() {
+        val calls = mutableListOf<String>()
+        val original = java.net.SocketTimeoutException("custom timeout")
+        try {
+            RemoteProfiles.fetchSnapshot("https://example.test/my-profiles.json") { calls += it; throw original }
+            fail("must fail")
+        } catch (error: java.net.SocketTimeoutException) {
+            assertSame(original, error)
+        }
+        assertEquals(listOf("https://example.test/my-profiles.json"), calls)
+    }
+
+    @Test fun failedBackupKeepsPrimaryFailureAndExplainsCacheRetention() {
+        try {
+            RemoteProfiles.fetchSnapshot(RemoteProfiles.DEFAULT_URL) { throw java.net.SocketTimeoutException("timeout") }
+            fail("must fail")
+        } catch (error: java.io.IOException) {
+            assertTrue(error.message.orEmpty().contains("缓存保留"))
+            assertEquals(1, error.suppressed.size)
+            assertTrue(error.cause is java.net.SocketTimeoutException)
+        }
+    }
+
     @Test fun mguUsesResourceLifecycleWithoutChangingBootstrapOrActivationPolicy() {
         val mgu = HeadUnitProfiles.BMW_ID85
         assertTrue(mgu.screenResourceLifecycleEnabled(false))

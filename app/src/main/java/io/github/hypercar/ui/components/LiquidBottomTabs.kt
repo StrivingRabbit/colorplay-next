@@ -97,10 +97,11 @@ fun LiquidBottomTabs(
                 },
                 highlight = { Highlight(width = 0.7.dp, blurRadius = 1.dp, alpha = 0.45f,
                     style = HighlightStyle.Default(intensity = 0.30f, angle = 60f, falloff = 2f)) },
-                shadow = { Shadow(radius = 20.dp, color = Color.Black.copy(alpha = 0.38f)) },
+                shadow = { Shadow(radius = if (dark) 18.dp else 10.dp,
+                    color = Color.Black.copy(alpha = if (dark) 0.30f else 0.09f)) },
                 innerShadow = null,
                 exportedBackdrop = barBackdrop,
-                onDrawSurface = { drawRect(if (dark) Color(0xFF7489A5).copy(alpha = 0.27f) else Color.White.copy(alpha = 0.60f)) },
+                onDrawSurface = { drawRect(if (dark) Color(0xFF7489A5).copy(alpha = 0.22f) else Color.White.copy(alpha = 0.48f)) },
             )
             .padding(4.dp)
             .selectableGroup(),

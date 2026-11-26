@@ -123,7 +123,8 @@ internal fun HeadUnitPickerScreen(connected: Boolean, modifier: Modifier = Modif
                     } catch (cancelled: kotlinx.coroutines.CancellationException) {
                         throw cancelled
                     } catch (failure: Exception) {
-                        message = "更新失败：${failure.message ?: "网络不可用"}"
+                        message = "更新失败：${RemoteProfiles.failureReason(failure)}"
+                        HyperCarRepo.log("PROFILE_UPDATE_FAILED: ${failure.javaClass.simpleName}: ${failure.message}")
                     } finally {
                         refreshing = false
                     }
@@ -151,7 +152,7 @@ internal fun HeadUnitPickerScreen(connected: Boolean, modifier: Modifier = Modif
             LazyColumn(
                 Modifier.fillMaxWidth().weight(1f),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(bottom = 12.dp),
+                contentPadding = PaddingValues(bottom = io.github.hypercar.ui.components.floatingChromeBottomPadding()),
             ) {
                 if (blockedMessage != null || (!searching && group == null)) {
                     item("current") {

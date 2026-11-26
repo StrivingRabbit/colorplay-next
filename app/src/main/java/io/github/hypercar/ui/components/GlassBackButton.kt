@@ -21,22 +21,29 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import io.github.hypercar.ui.theme.TextPrimary
+import io.github.hypercar.ui.theme.LocalAppPalette
 
-/** Icon-only back control, with a 48dp target and clipped, ripple-free physical feedback. */
+/** 40dp 返回按钮，保留 48dp 触控区，仅缩放视觉层且不绘制矩形涟漪。 */
 @Composable
 fun GlassBackButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
     val shape = RoundedCornerShape(50)
+    val dark = LocalAppPalette.current.dark
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val scale by animateFloatAsState(if (pressed) 0.92f else 1f, label = "back-press")
     Box(
-        modifier.size(48.dp).graphicsLayer { scaleX = scale; scaleY = scale }
-            .liquidGlassSurface(shape, Color.White.copy(alpha = 0.09f), blurRadius = 3.dp,
-                refractionHeight = 10.dp, refractionAmount = 12.dp)
-            .clip(shape)
+        modifier.size(48.dp)
             .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        Icon(Icons.AutoMirrored.Rounded.ArrowBack, "返回", tint = TextPrimary, modifier = Modifier.size(22.dp))
+        Box(
+            Modifier.size(40.dp).graphicsLayer { scaleX = scale; scaleY = scale }
+                .liquidGlassSurface(shape, Color.White.copy(alpha = if (dark) 0.09f else 0.42f), blurRadius = 3.dp,
+                    refractionHeight = 10.dp, refractionAmount = 12.dp)
+                .clip(shape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(Icons.AutoMirrored.Rounded.ArrowBack, "返回", tint = TextPrimary, modifier = Modifier.size(20.dp))
+        }
     }
 }

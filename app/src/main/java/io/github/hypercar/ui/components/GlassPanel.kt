@@ -49,10 +49,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import io.github.hypercar.ui.theme.DeepSpace
+import io.github.hypercar.ui.theme.LocalAppPalette
 import io.github.hypercar.ui.theme.ElectricCyan
 import io.github.hypercar.ui.theme.LocalGlass
 
@@ -69,6 +70,7 @@ fun Modifier.liquidGlassSurface(
     refractionAmount: Dp = 20.dp,
 ): Modifier {
     val backdrop = LocalLiquidBackdrop.current
+    val dark = LocalAppPalette.current.dark
     return if (backdrop != null) {
         drawBackdrop(
             backdrop = backdrop,
@@ -76,7 +78,8 @@ fun Modifier.liquidGlassSurface(
             // Explicit weak directional reflection, not the library's full-strength default ring.
             highlight = { Highlight(width = 0.6.dp, blurRadius = 0.8.dp, alpha = 0.38f,
                 style = HighlightStyle.Default(intensity = 0.24f, angle = 60f, falloff = 2f)) },
-            shadow = { Shadow(radius = 12.dp, color = Color.Black.copy(alpha = 0.24f)) },
+            shadow = { Shadow(radius = if (dark) 12.dp else 8.dp,
+                color = Color.Black.copy(alpha = if (dark) 0.24f else 0.07f)) },
             innerShadow = null,
             effects = {
                 vibrancy()
@@ -135,7 +138,7 @@ fun SectionLabel(text: String, modifier: Modifier = Modifier) {
     Text(
         text = text,
         style = MaterialTheme.typography.labelLarge,
-        color = ElectricCyan.copy(alpha = 0.85f),
+        color = ElectricCyan,
         modifier = modifier.padding(start = 4.dp, top = 4.dp),
     )
 }
@@ -143,7 +146,7 @@ fun SectionLabel(text: String, modifier: Modifier = Modifier) {
 /**
  * 胶囊按钮（主按钮全宽 52dp，最小触达 44dp）：
  * [filled] = true 使用强调色玻璃；false 使用轻染色玻璃（停止 / 断开等次要动作）。
- * 深色模式用强调色文字，浅色强调按钮用深色文字，保证折射背景上的可读性。
+ * 强调按钮使用高覆盖染色与对比文字，文字颜色与表面染色独立计算。
  */
 @Composable
 fun CapsuleButton(
@@ -163,21 +166,27 @@ fun CapsuleButton(
     horizontalPadding: Dp = 20.dp,
 ) {
     val shape = RoundedCornerShape(24.dp)
-    val resolvedContent = if (contentColor == Color.Unspecified) {
-        if (filled && !io.github.hypercar.ui.theme.LocalAppPalette.current.dark) DeepSpace else containerColor
-    } else {
+    val palette = LocalAppPalette.current
+    val dark = palette.dark
+    val resolvedContent = if (contentColor != Color.Unspecified) {
         contentColor
+    } else if (filled) {
+        if (containerColor.luminance() > 0.179f) Color(0xFF101820) else Color.White
+    } else {
+        containerColor
     }
-    val tint = resolvedContent.copy(alpha = if (enabled) 1f else 0.4f)
-    val dark = io.github.hypercar.ui.theme.LocalAppPalette.current.dark
-    val opacity = if (enabled) 1f else 0.35f
+    val tint = if (enabled) resolvedContent else palette.secondaryText.copy(alpha = 0.65f)
+    val surfaceTint = when {
+        !enabled -> palette.inset.copy(alpha = 0.72f)
+        filled -> containerColor.copy(alpha = 0.94f)
+        else -> Color.White.copy(alpha = if (dark) 0.04f else 0.10f)
+    }
     Row(
         modifier = modifier
             .heightIn(min = 52.dp)
             .liquidGlassSurface(
                 shape = shape,
-                tint = if (filled) containerColor.copy(alpha = 0.16f * opacity)
-                    else Color.White.copy(alpha = (if (dark) 0.04f else 0.10f) * opacity),
+                tint = surfaceTint,
                 blurRadius = 4.dp,
                 refractionHeight = 6.dp,
                 refractionAmount = 8.dp,
