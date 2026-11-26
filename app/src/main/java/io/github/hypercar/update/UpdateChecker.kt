@@ -6,7 +6,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
+import java.math.BigInteger
 
 /**
  * 自动更新：读 GitHub Releases API 比较版本。
@@ -38,7 +40,6 @@ sealed interface UpdateUiState {
 
 object UpdateCenter {
 
-    private const val API = "https://api.github.com/repos/StrivingRabbit/colorplay-next/releases/latest"
     private const val PREFS = "hypercar_update"
     private const val KEY_LAST_CHECK = "last_check_at"
     private const val KEY_DISMISSED = "dismissed_tag"
@@ -95,11 +96,11 @@ object UpdateCenter {
     private suspend fun fetchLatest(context: Context): ReleaseInfo? = withContext(Dispatchers.IO) {
         // 会话期间进程被绑到车机热点（无外网）——必须挑一条真有外网的网络，
         // 否则「检查更新」100% 失败（2026-10-25 验证）。
-        val conn = io.github.hypercar.net.InternetRoute.open(context, API).apply {
+        val conn = io.github.hypercar.net.InternetRoute.open(context, releaseApiUrl(currentVersion)).apply {
             requestMethod = "GET"
             setRequestProperty("Accept", "application/vnd.github+json")
             // GitHub 要求带 User-Agent，否则 403
-            setRequestProperty("User-Agent", "HyperCar/${BuildConfig.VERSION_NAME}")
+            setRequestProperty("User-Agent", "ColorPlay-Next/${BuildConfig.VERSION_NAME}")
         }
         try {
             val code = conn.responseCode
@@ -110,44 +111,105 @@ object UpdateCenter {
             }
             if (code !in 200..299) throw IllegalStateException("GitHub 返回 HTTP $code")
 
-            val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
-            val tag = json.optString("tag_name").ifBlank { return@withContext null }
-            val version = tag.removePrefix("v").removePrefix("V")
-            val apk = json.optJSONArray("assets")
-                ?.let { assets ->
-                    (0 until assets.length())
-                        .map { assets.getJSONObject(it) }
-                        .firstOrNull { it.optString("name").endsWith(".apk", ignoreCase = true) }
-                }
-            ReleaseInfo(
-                tag = tag,
-                version = version,
-                notes = json.optString("body").trim(),
-                pageUrl = json.optString("html_url"),
-                apkUrl = apk?.optString("browser_download_url")?.takeIf { it.isNotBlank() },
-                apkSize = apk?.optLong("size") ?: 0L,
-                publishedAt = json.optString("published_at"),
-            )
+            parseLatestRelease(conn.inputStream.bufferedReader().use { it.readText() }, currentVersion)
         } finally {
             conn.disconnect()
         }
     }
 
-    /**
-     * 版本比较：按 `.` 拆段做数值比较，缺失段按 0 处理（`0.1.0` < `0.1.0.42`）。
-     * 非数字后缀（如 `-beta`）忽略，只比较数字段。
-     */
-    fun isNewer(latest: String, current: String): Boolean {
-        fun segments(v: String) = v.split('.', '-', '+')
-            .mapNotNull { it.takeWhile(Char::isDigit).toIntOrNull() }
-        val a = segments(latest)
-        val b = segments(current)
-        for (i in 0 until maxOf(a.size, b.size)) {
-            val x = a.getOrElse(i) { 0 }
-            val y = b.getOrElse(i) { 0 }
-            if (x != y) return x > y
+    fun isNewer(latest: String, current: String): Boolean =
+        compareReleaseVersions(latest, current)?.let { it > 0 } ?: false
+}
+
+internal fun isAlphaVersion(version: String): Boolean =
+    Regex("-alpha\\.[0-9]+(?:\\+.*)?$").containsMatchIn(version)
+
+internal fun releaseApiUrl(currentVersion: String): String {
+    val releases = "https://api.github.com/repos/StrivingRabbit/colorplay-next/releases"
+    return if (isAlphaVersion(currentVersion)) "$releases?per_page=100" else "$releases/latest"
+}
+
+private val alphaTag = Regex("v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-alpha\\.(0|[1-9][0-9]*)")
+
+/** alpha 只读取自己的预发布流，正式版只读取 latest，均不回退到另一渠道。 */
+internal fun parseLatestRelease(payload: String, currentVersion: String): ReleaseInfo? {
+    val json = if (isAlphaVersion(currentVersion)) {
+        val releases = JSONArray(payload)
+        (0 until releases.length()).mapNotNull { releases.optJSONObject(it) }
+            .filter {
+                !it.optBoolean("draft") && it.optBoolean("prerelease") &&
+                    alphaTag.matches(it.optString("tag_name")) && releaseApk(it, requireUploaded = true) != null
+            }
+            .maxWithOrNull { a, b ->
+                compareReleaseVersions(a.getString("tag_name"), b.getString("tag_name")) ?: 0
+            }
+    } else {
+        JSONObject(payload).takeUnless {
+            it.optBoolean("draft") || it.optBoolean("prerelease") ||
+                isAlphaVersion(it.optString("tag_name"))
         }
-        return false
+    } ?: return null
+    val tag = json.optString("tag_name").ifBlank { return null }
+    val apk = releaseApk(json, requireUploaded = isAlphaVersion(currentVersion))
+    return ReleaseInfo(
+        tag = tag,
+        version = tag.removePrefix("v").removePrefix("V"),
+        notes = json.optString("body").trim(),
+        pageUrl = json.optString("html_url"),
+        apkUrl = apk?.optString("browser_download_url")?.takeIf { it.isNotBlank() },
+        apkSize = apk?.optLong("size") ?: 0L,
+        publishedAt = json.optString("published_at"),
+    )
+}
+
+private fun releaseApk(json: JSONObject, requireUploaded: Boolean): JSONObject? =
+    json.optJSONArray("assets")?.let { assets ->
+        (0 until assets.length()).mapNotNull { assets.optJSONObject(it) }
+            .firstOrNull {
+                it.optString("name").endsWith(".apk", ignoreCase = true) &&
+                    (!requireUploaded || (it.optString("state") == "uploaded" &&
+                        it.optString("browser_download_url").isNotBlank()))
+            }
     }
 
+internal data class ParsedReleaseVersion(val core: List<BigInteger>, val prerelease: List<String>)
+
+internal fun parseReleaseVersion(version: String): ParsedReleaseVersion? {
+    val value = version.removePrefix("v").removePrefix("V").substringBefore('+')
+    val core = value.substringBefore('-')
+    if (!Regex("[0-9]+(?:\\.[0-9]+)*").matches(core)) return null
+    val suffix = value.substringAfter('-', "")
+    if ('-' in value && !Regex("[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*").matches(suffix)) return null
+    return ParsedReleaseVersion(
+        core.split('.').map { it.toBigInteger() },
+        if (suffix.isEmpty()) emptyList() else suffix.split('.'),
+    )
+}
+
+/** 保留旧多段数字版本；同 core 下正式版高于预发布，数字序号按数值比较。 */
+internal fun compareReleaseVersions(latest: String, current: String): Int? {
+    val a = parseReleaseVersion(latest) ?: return null
+    val b = parseReleaseVersion(current) ?: return null
+    for (i in 0 until maxOf(a.core.size, b.core.size)) {
+        val result = a.core.getOrElse(i) { BigInteger.ZERO }
+            .compareTo(b.core.getOrElse(i) { BigInteger.ZERO })
+        if (result != 0) return result
+    }
+    if (a.prerelease.isEmpty() || b.prerelease.isEmpty()) {
+        return b.prerelease.size.compareTo(a.prerelease.size)
+    }
+    for (i in 0 until minOf(a.prerelease.size, b.prerelease.size)) {
+        val x = a.prerelease[i]
+        val y = b.prerelease[i]
+        val xn = x.toBigIntegerOrNull()
+        val yn = y.toBigIntegerOrNull()
+        val result = when {
+            xn != null && yn != null -> xn.compareTo(yn)
+            xn != null -> -1
+            yn != null -> 1
+            else -> x.compareTo(y)
+        }
+        if (result != 0) return result
+    }
+    return a.prerelease.size.compareTo(b.prerelease.size)
 }

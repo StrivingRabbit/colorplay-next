@@ -19,6 +19,16 @@ Android 原生 Compose 应用，基于 [HyperCar](https://github.com/fw867/hyper
 - 升级顺序：干净工作区 → `git fetch upstream main` → 对比 `UpstreamBase.COMMIT..upstream/main` → 在独立升级分支合并 → 审查 OPPO / UI 接入冲突 → JVM、原生、Release Lint 和真机回归 → 更新底座记录并用原证书发布。fetch 失败时不更新底座记录。
 - 尽可能将定制封装在独立文件；必须修改的会话接入点保持小范围，不能保证完全无冲突。应用内“检查更新”只检查 ColorPlay Next APK，不直接替换底座、不安装 HyperCar APK。
 
+## Alpha 自动升级实验线
+
+- `main` 保持正式开发线；`alpha` 是用户授权的自动合并实验线，沿用包名与原证书，安装后会覆盖正式 App，并非独立双开应用。
+- 工作流“同步上游并发布 Alpha”必须留在默认分支 `main`。每天北京时间 06:00（GitHub schedule 可能延迟）检测 `fw867/hypercar/main`，也可在 Actions 选择 **main** 手动 Run workflow。首次从新建 alpha 起点引导一个候选版，其后无上游变化不重复出包。
+- 顺序：准备临时合并 → Rust 全量测试与交叉编译 → Android 单测/Lint/Release 构建 → 原签名指纹强校验 → 普通推送 alpha → 发布 `vX.Y.Z-alpha.N` 预发布，绝不设置为 latest。合并冲突不自动选边，验证失败不推进 alpha。
+- 签名使用仓库 Secrets `KEYSTORE_BASE64`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`，缺失直接失败。已知的历史 Rust 测试失败仍会阻止 Alpha，不以跳过测试冒充验证通过。
+- Alpha APK 的检查更新仅跟踪本仓库合法 Alpha 预发布；正式 APK 仍读取最新正式 Release。Alpha 构建通过不代表已完成真机/实车验收，正式合并发布需人工确认。
+- 安装编号按 `max(alpha, main) + 1` 递增；升级回正式版必须发布更大的 versionCode，并使用不低于 Alpha 目标核心版本的正式版本号，不能直接覆盖回旧正式 APK。`main` 定制变更需要人工同步至 alpha；本流程仅自动同步上游。
+- `.github`、`tools`、版本文件、底座元数据与项目约定由本分支维护，上游不能静默替换发布脚本。Release 上传若在分支推送后失败，重跑会尝试重发同一候选版，不移动已有发布标签。
+
 ## 上游 HyperCar 说明
 
 让 Android 手机连接无线 CarPlay 车机，将地图、音乐和应用画面送到车机屏幕，并转发声音与触摸操作。支持 **自绘车机 UI**、**小米 CarWith** 和 **系统 CarLife+** 三种画面来源，无需 root。

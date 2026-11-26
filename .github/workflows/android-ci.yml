@@ -31,7 +31,7 @@ name: Build Release APK
 
 on:
   push:
-    branches: ['**'] # 任何分支的推送都出包；是否发布 Release 由提交信息里的 [release] 决定
+    branches-ignore: ['alpha'] # alpha 由独立同步工作流检查、构建与预发布，避免重复出包
   workflow_dispatch:
     inputs:
       publish:
@@ -44,8 +44,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
+  group: publish-colorplay-next
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -168,6 +168,8 @@ jobs:
 
       - name: 计算版本号
         id: version
+        env:
+          PUBLISH: ${{ steps.meta.outputs.publish }}
         run: |
           set -eu
           python3 - <<'PYVERSION'
@@ -177,7 +179,9 @@ jobs:
                         if line.strip() and not line.lstrip().startswith("#"))
           version = values["versionName"].strip()
           code = int(values["versionCode"].strip())
-          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-beta\.[0-9]+)?", version) or not 1 <= code <= 2_100_000_000:
+          if ("-alpha." in version or os.environ.get("GITHUB_REF") == "refs/heads/alpha") and os.environ.get("PUBLISH") == "true":
+              raise SystemExit("alpha 版本只能由独立 alpha 工作流预发布，禁止作为正式 Release 发布")
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-(?:beta|alpha)\.[0-9]+)?", version) or not 1 <= code <= 2_100_000_000:
               raise SystemExit("Invalid version.properties")
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"name={version}\ncode={code}\ntag=v{version}\n")
@@ -302,6 +306,34 @@ jobs:
 
       # 发布放在单测**之后**：测试红了就不该产出「正式版」Release
       # 手动 workflow_dispatch + publish=true 同样必须通过测试。
+      - name: 防止正式版安装编号低于 Alpha
+        if: steps.meta.outputs.publish == 'true'
+        env:
+          RELEASE_CODE: ${{ steps.version.outputs.code }}
+        run: |
+          set -euo pipefail
+          # 不存在 alpha 可继续；网络/鉴权失败必须阻断，不能当作分支不存在。
+          ALPHA_REF=$(git ls-remote --heads origin refs/heads/alpha)
+          if [ -n "$ALPHA_REF" ]; then
+            git fetch --no-tags origin refs/heads/alpha:refs/remotes/origin/alpha
+            python3 - <<'PYALPHA'
+          import os, re, subprocess
+          text = subprocess.check_output(['git', 'show', 'refs/remotes/origin/alpha:version.properties'], text=True)
+          values = dict(line.strip().split('=', 1) for line in text.splitlines()
+                        if line.strip() and not line.lstrip().startswith('#'))
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+', values['versionName'].strip()):
+              print('远程 alpha 尚无 Alpha 实验版本，跳过安装编号闸门')
+              raise SystemExit(0)
+          alpha_code = int(values['versionCode'].strip())
+          release_code = int(os.environ['RELEASE_CODE'])
+          if not 1 <= alpha_code <= 2_100_000_000:
+              raise SystemExit('远程 alpha versionCode 无效，禁止正式发布')
+          if release_code <= alpha_code:
+              raise SystemExit(f'正式版 versionCode={release_code} 必须高于 alpha={alpha_code}；请先提高 main 的 versionCode，确保 Alpha 用户可覆盖安装回正式版')
+          print(f'安装编号闸门通过：正式版 {release_code} > Alpha {alpha_code}')
+          PYALPHA
+          fi
+
       - name: 发布 GitHub Release
         if: steps.meta.outputs.publish == 'true'
         env:

@@ -11,8 +11,8 @@ val releaseVersion = Properties().apply {
     rootProject.file("version.properties").inputStream().use { load(it) }
 }
 val appVersionName = releaseVersion.getProperty("versionName")?.trim()
-    ?.takeIf { Regex("[0-9]+\\.[0-9]+\\.[0-9]+(?:-beta\\.[0-9]+)?").matches(it) }
-    ?: throw GradleException("version.properties 的 versionName 必须为 X.Y.Z 或 X.Y.Z-beta.N")
+    ?.takeIf { Regex("[0-9]+\\.[0-9]+\\.[0-9]+(?:-(?:alpha|beta)\\.[0-9]+)?").matches(it) }
+    ?: throw GradleException("version.properties 的 versionName 必须为 X.Y.Z、X.Y.Z-alpha.N 或 X.Y.Z-beta.N")
 val appVersionCode = releaseVersion.getProperty("versionCode")?.trim()?.toIntOrNull()
     ?.takeIf { it in 1..2_100_000_000 }
     ?: throw GradleException("version.properties 的 versionCode 无效")

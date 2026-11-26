@@ -1,0 +1,287 @@
+name: 同步上游并发布 Alpha
+
+# GitHub 仅为默认分支上的工作流触发 schedule；本文件必须先合入 main。
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/alpha-upstream.yml
+      - tools/prepare-alpha.py
+  schedule:
+    - cron: '0 22 * * *' # 北京时间每天 06:00
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-colorplay-next
+  cancel-in-progress: false
+
+jobs:
+  alpha:
+    if: github.repository == 'StrivingRabbit/colorplay-next' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出 Alpha 分支
+        uses: actions/checkout@v4
+        with:
+          repository: StrivingRabbit/colorplay-next
+          ref: alpha
+          fetch-depth: 0
+
+      - name: 准备本地候选提交（不推送）
+        id: prepare
+        env:
+          ALPHA_REPO_DIR: ${{ github.workspace }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch origin main alpha
+          if UPSTREAM_URL=$(git remote get-url upstream 2>/dev/null); then
+            test "$UPSTREAM_URL" = 'https://github.com/fw867/hypercar.git'
+          else
+            git remote add upstream https://github.com/fw867/hypercar.git
+          fi
+          git fetch upstream main
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          echo "ALPHA_BASE=$(git rev-parse origin/alpha)" >> "$GITHUB_ENV"
+          # 推送后发布失败时，重建同版本；只把明确的 HTTP 404 当作未发布。
+          ALPHA_RETRY_UNPUBLISHED=$(python3 - <<'PYRETRY'
+          from pathlib import Path
+          import re, subprocess
+          values = dict(line.strip().split('=', 1) for line in Path('version.properties').read_text().splitlines()
+                        if line.strip() and not line.lstrip().startswith('#'))
+          version = values['versionName'].strip()
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+', version):
+              print('false')
+          else:
+              response = subprocess.run(['gh', 'api', '--include',
+                  f'repos/StrivingRabbit/colorplay-next/releases/tags/v{version}'],
+                  capture_output=True, text=True)
+              statuses = re.findall(r'^HTTP/\S+\s+(\d{3})\b', response.stdout, re.M)
+              status = statuses[-1] if statuses else None
+              if response.returncode == 0 and status == '200':
+                  print('false')
+              elif response.returncode != 0 and status == '404':
+                  print('true')
+              else:
+                  raise SystemExit('无法确认 Alpha 发布状态，禁止将鉴权、限流或网络错误当作未发布：' + response.stderr)
+          PYRETRY
+          )
+          export ALPHA_RETRY_UNPUBLISHED
+          # 只运行本仓库 main 中维护的准备脚本，不运行任意 fork 的脚本。
+          git show origin/main:tools/prepare-alpha.py > "$RUNNER_TEMP/prepare-alpha.py"
+          python3 "$RUNNER_TEMP/prepare-alpha.py"
+
+      - name: 无更新时记录摘要
+        if: steps.prepare.outputs.changed == 'false'
+        run: echo '上游无新提交且已完成 Alpha 引导，本次不构建、不推送、不发布；main 的定制变更仍需人工确认同步。' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 安装 JDK 17
+        if: steps.prepare.outputs.changed == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Rust 与 Android 目标
+        if: steps.prepare.outputs.changed == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: 安装 NDK r27c
+        if: steps.prepare.outputs.changed == 'true'
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+          link-to-sdk: true
+
+      - name: 安装 cargo-ndk
+        if: steps.prepare.outputs.changed == 'true'
+        run: cargo install cargo-ndk --locked
+
+      - name: Rust 全量测试（失败禁止发布）
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          CMAKE_GENERATOR: Ninja
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path rust-core/Cargo.toml 2>&1 | tee "$RUNNER_TEMP/alpha-rust-test.log"
+
+      - name: 编译 Rust 核心层
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+          CMAKE_GENERATOR: Ninja
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        working-directory: rust-core
+        run: |
+          set -euo pipefail
+          cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
+          test -f ../app/src/main/jniLibs/arm64-v8a/libhypercar_core.so
+
+      - name: 配置 Gradle
+        if: steps.prepare.outputs.changed == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 写入正式签名配置
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          required = ('KEYSTORE_BASE64', 'KEYSTORE_PASSWORD', 'KEY_ALIAS', 'KEY_PASSWORD')
+          missing = [key for key in required if not os.environ.get(key)]
+          if missing:
+              raise SystemExit('缺少正式签名 Secrets：' + ', '.join(missing))
+          Path('release.jks').write_bytes(base64.b64decode(''.join(os.environ['KEYSTORE_BASE64'].split()), validate=True))
+          def escape(value):
+              return ''.join('\\u%04x' % ord(char) for char in value)
+          Path('keystore.properties').write_text(
+              'storeFile=release.jks\n'
+              + 'storePassword=' + escape(os.environ['KEYSTORE_PASSWORD']) + '\n'
+              + 'keyAlias=' + escape(os.environ['KEY_ALIAS']) + '\n'
+              + 'keyPassword=' + escape(os.environ['KEY_PASSWORD']) + '\n')
+          PY
+
+      - name: 构建 APK、Android 单测与 Release Lint
+        if: steps.prepare.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          bash ./gradlew :app:assembleRelease :app:testDebugUnitTest :app:lintRelease \
+            -Phypercar.officialBuild=true --stacktrace 2>&1 | tee "$RUNNER_TEMP/alpha-gradle.log"
+
+      - name: 强制验证正式证书并准备发布附件
+        if: steps.prepare.outputs.changed == 'true'
+        id: package
+        env:
+          VERSION: ${{ steps.prepare.outputs.version }}
+          CODE: ${{ steps.prepare.outputs.code }}
+          UPSTREAM: ${{ steps.prepare.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]
+          [[ "$CODE" =~ ^[0-9]+$ ]]
+          [[ "$UPSTREAM" =~ ^[0-9a-f]{40}$ ]]
+          APK=app/build/outputs/apk/release/app-release.apk
+          test -f "$APK"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          APKSIGNER=$(find "$SDK/build-tools" -name apksigner -type f | sort -V | tail -n1)
+          test -n "$APKSIGNER"
+          "$APKSIGNER" verify --print-certs "$APK" > "$RUNNER_TEMP/alpha-certs.txt"
+          python3 - <<'PY'
+          import os, re, zipfile
+          from pathlib import Path
+          certs = Path(os.environ['RUNNER_TEMP'], 'alpha-certs.txt').read_text()
+          expected = 'e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66'
+          actual = re.findall(r'^Signer #\d+ certificate SHA-256 digest: (\S+)$', certs, re.M)
+          if 'CN=Android Debug' in certs or len(actual) != 1 or actual[0].lower() != expected:
+              raise SystemExit('APK 正式签名证书不匹配，禁止推送与发布')
+          with zipfile.ZipFile('app/build/outputs/apk/release/app-release.apk') as apk:
+              if 'lib/arm64-v8a/libhypercar_core.so' not in apk.namelist():
+                  raise SystemExit('APK 缺少 Rust 核心层')
+          PY
+          NAME="colorplay-next-${VERSION}-release.apk"
+          cp "$APK" "$NAME"
+          sha256sum "$NAME" > "$NAME.sha256"
+          SHA=$(cut -d' ' -f1 "$NAME.sha256")
+          {
+            echo "### ColorPlay Next ${VERSION}（Alpha 预发布）"
+            echo
+            echo 'Alpha 为自动合并上游的测试版本，不代表正式稳定版。'
+            echo "- versionCode：${CODE}"
+            echo "- 上游：fw867/hypercar @ ${UPSTREAM}"
+            echo "- 候选提交：$(git rev-parse HEAD)"
+            echo "- APK SHA-256：${SHA}"
+            echo '- 正式签名证书 SHA-256：e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66'
+            echo '- 检查：Rust 全量测试、Android 单元测试、Release Lint、Release 构建均通过。'
+          } > "$RUNNER_TEMP/alpha-notes.md"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: 所有检查通过后推送 Alpha 并创建预发布
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          NAME: ${{ steps.package.outputs.name }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          # 重试可复用指向同一候选提交的标签，但绝不移动已有标签。
+          REFS=$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          if [ -n "$REFS" ]; then
+            EXISTING=$(printf '%s\n' "$REFS" | awk '/\^\{\}$/ {print $1; found=1} END {if (!found) exit 1}') \
+              || EXISTING=$(printf '%s\n' "$REFS" | awk 'NF {print $1; exit}')
+            test "$EXISTING" = "$(git rev-parse HEAD)"
+          fi
+          # 即使使用共享发布锁，仍对人工/其他工作流的意外更新进行检查。
+          CURRENT=$(git ls-remote origin refs/heads/alpha | cut -f1)
+          test "$CURRENT" = "$ALPHA_BASE"
+          git push origin HEAD:refs/heads/alpha
+          gh release create "$TAG" "$NAME" "$NAME.sha256" \
+            --repo StrivingRabbit/colorplay-next \
+            --target "$(git rev-parse HEAD)" \
+            --title "ColorPlay Next ${VERSION}" \
+            --notes-file "$RUNNER_TEMP/alpha-notes.md" \
+            --prerelease --latest=false
+          cat "$RUNNER_TEMP/alpha-notes.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 失败摘要（不推送、不发布）
+        if: failure()
+        run: |
+          {
+            echo '### Alpha 同步失败'
+            echo '仅显式保护清单中的项目身份文件（.github、tools、version.properties、UpstreamBase.kt、AGENTS.md）确定性保留本仓库版本；其他源码冲突一律中止，不使用全局 ours/theirs。'
+            echo '测试、Lint 或签名失败不会推送候选提交。'
+            echo '若失败发生在推送之后的 Release 创建阶段，请检查远程 alpha 与发布状态后人工恢复。'
+            for LOG in "$RUNNER_TEMP/alpha-rust-test.log" "$RUNNER_TEMP/alpha-gradle.log"; do
+              if [ -f "$LOG" ]; then
+                echo
+                echo "#### $(basename "$LOG")（末尾 60 行）"
+                echo '```text'
+                tail -n 60 "$LOG"
+                echo '```'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 保存失败检查报告
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpha-failure-reports-${{ github.run_id }}
+          path: |
+            app/build/reports/tests/**
+            app/build/test-results/**
+            app/build/reports/lint-results-release*
+            ${{ runner.temp }}/alpha-rust-test.log
+            ${{ runner.temp }}/alpha-gradle.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: 清理签名材料
+        if: always()
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          for name in ('release.jks', 'keystore.properties'):
+              Path(name).unlink(missing_ok=True)
+          PY
