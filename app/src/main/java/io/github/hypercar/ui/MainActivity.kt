@@ -306,7 +306,8 @@ private fun MainContent(onStart: () -> Unit) {
     val updateState by UpdateCenter.state.collectAsStateWithLifecycle()
     var updateDialogClosed by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
-        if (UpdateCenter.shouldAutoCheck(context)) UpdateCenter.check(context)
+        // SharedPreferences may still be loading from disk at cold start; never wait on main.
+        if (withContext(Dispatchers.IO) { UpdateCenter.shouldAutoCheck(context) }) UpdateCenter.check(context)
     }
     val newRelease = (updateState as? UpdateUiState.Available)?.info
     if (newRelease != null && !updateDialogClosed &&

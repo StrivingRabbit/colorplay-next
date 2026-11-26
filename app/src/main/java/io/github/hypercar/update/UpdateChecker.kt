@@ -75,7 +75,7 @@ object UpdateCenter {
      * 查询最新 Release 并与本地版本比较。
      * @param force 手动检查：忽略 6 小时间隔（但仍会写入检查时间）
      */
-    suspend fun check(context: Context) {
+    suspend fun check(context: Context) = withContext(Dispatchers.IO) {
         _state.value = UpdateUiState.Checking
         prefs(context).edit().putLong(KEY_LAST_CHECK, System.currentTimeMillis()).apply()
         _state.value = try {

@@ -20,6 +20,9 @@ import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
 import com.kyant.backdrop.effects.vibrancy
+import com.kyant.backdrop.highlight.Highlight
+import com.kyant.backdrop.highlight.HighlightStyle
+import com.kyant.backdrop.shadow.Shadow
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -65,8 +68,10 @@ fun Modifier.liquidGlassSurface(
         drawBackdrop(
             backdrop = backdrop,
             shape = { shape },
-            highlight = null,
-            shadow = null,
+            // Explicit weak directional reflection, not the library's full-strength default ring.
+            highlight = { Highlight(width = 0.6.dp, blurRadius = 0.8.dp, alpha = 0.38f,
+                style = HighlightStyle.Default(intensity = 0.24f, angle = 60f, falloff = 2f)) },
+            shadow = { Shadow(radius = 12.dp, color = Color.Black.copy(alpha = 0.24f)) },
             innerShadow = null,
             effects = {
                 vibrancy()
@@ -85,7 +90,7 @@ fun Modifier.liquidGlassSurface(
     }
 }
 
-/** 无描边的背景折射表面；glow、glowColor 仅为兼容现有调用保留，不再绘制辉光。 */
+/** 折射主体 + 受控方向反光及表面染色；glow 参数仅为兼容保留，不绘制外辉光。 */
 @Composable
 fun Modifier.glassPanel(
     cornerRadius: Dp = LocalGlass.current.cornerRadius,
@@ -97,7 +102,7 @@ fun Modifier.glassPanel(
     return this
         .liquidGlassSurface(
             shape = shape,
-            tint = if (dark) Color(0xFF142238).copy(alpha = 0.10f) else Color.White.copy(alpha = 0.10f),
+            tint = if (dark) Color(0xFF8BA5BB).copy(alpha = 0.14f) else Color.White.copy(alpha = 0.48f),
         )
         .clip(shape)
 }

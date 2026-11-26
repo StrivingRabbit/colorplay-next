@@ -47,6 +47,9 @@ import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
 import com.kyant.backdrop.effects.vibrancy
+import com.kyant.backdrop.highlight.Highlight
+import com.kyant.backdrop.highlight.HighlightStyle
+import com.kyant.backdrop.shadow.Shadow
 import io.github.hypercar.ui.theme.ElectricCyan
 import io.github.hypercar.ui.theme.LocalAppPalette
 import io.github.hypercar.ui.theme.TextSecondary
@@ -89,11 +92,12 @@ fun LiquidBottomTabs(
                     blur(4.dp.toPx())
                     lens(24.dp.toPx(), 24.dp.toPx())
                 },
-                highlight = null,
-                shadow = null,
+                highlight = { Highlight(width = 0.7.dp, blurRadius = 1.dp, alpha = 0.45f,
+                    style = HighlightStyle.Default(intensity = 0.30f, angle = 60f, falloff = 2f)) },
+                shadow = { Shadow(radius = 20.dp, color = Color.Black.copy(alpha = 0.38f)) },
                 innerShadow = null,
                 exportedBackdrop = barBackdrop,
-                onDrawSurface = { drawRect(if (dark) Color(0xFF121820).copy(alpha = 0.14f) else Color.White.copy(alpha = 0.22f)) },
+                onDrawSurface = { drawRect(if (dark) Color(0xFF7489A5).copy(alpha = 0.27f) else Color.White.copy(alpha = 0.60f)) },
             )
             .padding(4.dp)
             .selectableGroup(),
@@ -115,7 +119,7 @@ fun LiquidBottomTabs(
                     highlight = null,
                     shadow = null,
                     innerShadow = null,
-                    onDrawSurface = { drawRect(if (dark) Color.White.copy(alpha = 0.065f) else Color.Black.copy(alpha = 0.035f)) },
+                    onDrawSurface = { drawRect(if (dark) Color.White.copy(alpha = 0.12f) else Color(0xFF71849D).copy(alpha = 0.12f)) },
                 ),
         )
         Row(
