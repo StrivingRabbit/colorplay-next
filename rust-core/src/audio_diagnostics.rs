@@ -1,0 +1,858 @@
+//! Receiver feedback and retransmission of already sealed realtime main audio RTP.
+use crate::{bplist::{self, Value}, buffered_ownership::Ownership, emit_log, timing::monotonic_nanos};
+use parking_lot::Mutex;
+use std::{collections::VecDeque, io, net::{IpAddr, SocketAddr}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicU64, Ordering}}, time::{Duration, Instant}};
+use tokio::{net::UdpSocket, sync::{mpsc, watch}};
+
+const CACHE_PACKETS: usize = 32;
+const PCM_CACHE_PACKETS: usize = 72;
+const CACHE_AGE: Duration = Duration::from_millis(500);
+const MAX_PER_REQUEST: u16 = 16;
+const MAX_PER_SECOND: u16 = 32;
+
+struct CachedRtp {
+    seq: u16,
+    generation: u64,
+    sent_at: Instant,
+    wire: Vec<u8>,
+}
+
+struct ResendCache {
+    active: AtomicBool,
+    capacity: usize,
+    ownership: watch::Receiver<Ownership>,
+    packets: Mutex<VecDeque<CachedRtp>>,
+}
+
+impl ResendCache {
+    fn new(ownership: watch::Receiver<Ownership>, capacity: usize) -> Self {
+        Self { active: AtomicBool::new(true), capacity, ownership, packets: Mutex::new(VecDeque::with_capacity(capacity)) }
+    }
+
+    fn generation(&self) -> Option<u64> {
+        let state = self.ownership.borrow();
+        (state.owned && self.active.load(Ordering::Acquire)).then_some(state.losses)
+    }
+
+    fn remember(&self, seq: u16, generation: u64, wire: Vec<u8>) {
+        let mut packets = self.packets.lock();
+        if packets.back().is_some_and(|packet| packet.generation != generation) { packets.clear(); }
+        if packets.len() == self.capacity { packets.pop_front(); }
+        packets.push_back(CachedRtp { seq, generation, sent_at: Instant::now(), wire });
+    }
+
+    fn response(&self, seq: u16, generation: u64) -> Option<Vec<u8>> {
+        let packets = self.packets.lock();
+        let original = &packets.iter().rev().find(|p|
+            p.seq == seq && p.generation == generation && p.sent_at.elapsed() <= CACHE_AGE)?.wire;
+        let length = u16::try_from(original.len()).ok()?;
+        let mut response = Vec::with_capacity(4 + original.len());
+        response.extend_from_slice(&[0x80, 0xd6]);
+        // xiap2 _audioReceiveRTCP writes the original RTP byte count as a native
+        // little-endian halfword. The reference receiver uses the datagram size
+        // and dispatches everything after the four-byte header to its RTP path.
+        response.extend_from_slice(&length.to_le_bytes());
+        response.extend_from_slice(original);
+        Some(response)
+    }
+}
+
+#[derive(Default)]
+struct ResendTotals {
+    hits: u64,
+    misses: u64,
+    sent: u64,
+    futile_sent: u64,
+    send_errors: u64,
+    skipped: u64,
+}
+
+impl ResendTotals {
+    fn add(&mut self, result: &Self) {
+        self.hits += result.hits;
+        self.misses += result.misses;
+        self.sent += result.sent;
+        self.futile_sent += result.futile_sent;
+        self.send_errors += result.send_errors;
+        self.skipped += result.skipped;
+    }
+
+    fn fields(&self) -> String {
+        format!("cacheHits={} cacheMisses={} d6Sent={} d6SendErrors={} d6FutileSent={} resendSkipped={}",
+            self.hits, self.misses, self.sent, self.send_errors, self.futile_sent, self.skipped)
+    }
+}
+
+fn resend(socket: &UdpSocket, destination: Option<SocketAddr>, cache: &ResendCache, first: u16, count: u16, budget: &mut u16) -> ResendTotals {
+    let limit = count.min(MAX_PER_REQUEST);
+    let mut result = ResendTotals { skipped: u64::from(count - limit), ..Default::default() };
+    let Some(generation) = cache.generation() else {
+        result.skipped = u64::from(count);
+        return result;
+    };
+    for offset in 0..limit {
+        let seq = first.wrapping_add(offset);
+        let response = cache.response(seq, generation);
+        let hit = response.is_some();
+        result.hits += u64::from(hit);
+        result.misses += u64::from(!hit);
+        // Keep the ownership check and nonblocking write together across handover.
+        let state = cache.ownership.borrow();
+        if *budget == 0 || !state.owned || state.losses != generation || !cache.active.load(Ordering::Acquire) {
+            result.skipped += 1;
+            continue;
+        }
+        *budget -= 1;
+        // xiap2 uses an eight-byte negative response with original sequence and zero pad.
+        let [hi, lo] = seq.to_be_bytes();
+        let futile = [0x80, 0xd6, 4, 0, hi, lo, 0, 0];
+        let bytes = response.as_deref().unwrap_or(&futile);
+        let socket = socket2::SockRef::from(socket);
+        let written = match destination {
+            Some(peer) => socket.send_to_with_flags(bytes, &peer.into(), libc::MSG_DONTWAIT),
+            None => socket.send_with_flags(bytes, libc::MSG_DONTWAIT),
+        };
+        match written {
+            Ok(n) if n == bytes.len() && hit => result.sent += 1,
+            Ok(n) if n == bytes.len() => result.futile_sent += 1,
+            _ => result.send_errors += 1,
+        }
+    }
+    result
+}
+
+fn resend_request(packet: &[u8]) -> Option<(u16, u16, u16)> {
+    if !matches!(packet.len(), 8 | 16) || packet[0] != 0x80 || packet[1] != 0xd5 { return None; }
+    let word = |i| u16::from_be_bytes([packet[i], packet[i+1]]);
+    let count = word(6);
+    let length = word(2);
+    // The optional NTP timestamp contributes two more words.
+    (usize::from(length) == packet.len() / 4 - 1 && count != 0).then(|| (length, word(4), count))
+}
+
+pub(crate) struct ControlObserver {
+    worker: tokio::task::JoinHandle<()>,
+    label: String,
+    requests: Arc<AtomicU64>,
+    cache: Arc<ResendCache>,
+    totals: Arc<Mutex<ResendTotals>>,
+}
+
+impl Drop for ControlObserver {
+    fn drop(&mut self) {
+        self.cache.active.store(false, Ordering::Release);
+        self.worker.abort();
+        emit_log(&format!("AUDIO-RTCP: {} stream retired observedD5={} {}", self.label,
+            self.requests.load(Ordering::Relaxed), self.totals.lock().fields()));
+    }
+}
+
+impl ControlObserver {
+    pub(crate) fn start(socket: Arc<UdpSocket>, label: String, ownership: watch::Receiver<Ownership>,
+        pcm: bool, peer_ip: Option<IpAddr>) -> Self {
+        let local = socket.local_addr().map(|a| a.port()).ok();
+        let peer = socket.peer_addr().map(|a| a.port()).ok();
+        let source = if peer_ip.is_some() { "session_address" } else { "negotiated_endpoint" };
+        emit_log(&format!("AUDIO-RTCP: {label} listening localPort={local:?} peerControlPort={peer:?} sourceFilter={source}"));
+        let requests = Arc::new(AtomicU64::new(0));
+        let cache = Arc::new(ResendCache::new(ownership, if pcm { PCM_CACHE_PACKETS } else { CACHE_PACKETS }));
+        let totals = Arc::new(Mutex::new(ResendTotals::default()));
+        let worker = crate::callback_context::spawn(observe_control(socket, peer_ip, label.clone(), requests.clone(), cache.clone(), totals.clone(), emit_log));
+        Self { worker, label, requests, cache, totals }
+    }
+
+    pub(crate) fn generation(&self) -> Option<u64> { self.cache.generation() }
+
+    pub(crate) fn remember_sent(&self, seq: u16, generation: u64, wire: Vec<u8>) {
+        self.cache.remember(seq, generation, wire);
+    }
+}
+
+async fn observe_control(socket: Arc<UdpSocket>, peer_ip: Option<IpAddr>, label: String, requests: Arc<AtomicU64>,
+    cache: Arc<ResendCache>, totals: Arc<Mutex<ResendTotals>>, log: impl Fn(&str)) {
+    let period = Duration::from_secs(10);
+    let mut summary = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    summary.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (mut requested_packets, mut other, mut candidates, mut errors) = (0u64, 0u64, 0u64, 0u64);
+    let mut last = None;
+    let mut budget = MAX_PER_SECOND;
+    let mut budget_window = Instant::now();
+    // The sentinel byte distinguishes an oversized datagram from the extended request.
+    let mut bytes = [0; 17];
+    loop {
+        tokio::select! {
+            result = socket.recv_from(&mut bytes) => match result {
+                Ok((n, source)) => {
+                    if peer_ip.is_some_and(|expected| expected.to_canonical() != source.ip().to_canonical()) {
+                        continue;
+                    }
+                    if let Some((length, first, count)) = resend_request(&bytes[..n]) {
+                        let seen = requests.fetch_add(1, Ordering::Relaxed) + 1;
+                        requested_packets += u64::from(count);
+                        let now = monotonic_nanos();
+                        last = Some((first, count, now));
+                        if budget_window.elapsed() >= Duration::from_secs(1) {
+                            budget = MAX_PER_SECOND;
+                            budget_window = Instant::now();
+                        }
+                        let result = resend(&socket, peer_ip.map(|_| source), &cache, first, count, &mut budget);
+                        totals.lock().add(&result);
+                        if seen <= 3 {
+                            log(&format!("AUDIO-RTCP: {label} RX=0xD5 lengthWordsMinusOne={length} firstMissingSeq={first} count={count} sourcePort={} monoNs={now} {}", source.port(), result.fields()));
+                        }
+                    } else if n >= 2 && bytes[1] == 0xd5 {
+                        candidates += 1;
+                        if candidates == 1 {
+                            log(&format!("AUDIO-RTCP: {label} unconfirmed 0xD5 header={:02x?} capturedBytes={n} (max=17)", &bytes[..n]));
+                        }
+                    } else { other += 1; }
+                }
+                Err(error) => {
+                    errors += 1;
+                    if errors == 1 { log(&format!("AUDIO-RTCP: {label} receive error={error}")); }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            },
+            _ = summary.tick() => {
+                log(&format!("AUDIO-RTCP: {label} d5={} requestedPackets={requested_packets} unconfirmedD5={candidates} other={other} receiveErrors={errors} lastFirstCountMonoNs={last:?} {}",
+                    requests.load(Ordering::Relaxed), totals.lock().fields()));
+            }
+        }
+    }
+}
+
+const D4_LOG_INTERVAL_NS: u64 = 10_000_000_000;
+const D4_REPORTS_MAX_PENDING: usize = 4;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct D4Counts {
+    attempted: u64,
+    sent: u64,
+    would_block: u64,
+    enobufs: u64,
+    refused: u64,
+    other: u64,
+    short: u64,
+    last_errno: Option<i32>,
+}
+
+impl D4Counts {
+    fn record(&mut self, result: &io::Result<usize>, bytes: usize) -> bool {
+        self.attempted += 1;
+        match result {
+            Ok(written) if *written == bytes => { self.sent += 1; return false; }
+            Ok(_) => { self.short += 1; self.last_errno = None; }
+            Err(error) => {
+                self.last_errno = error.raw_os_error();
+                match self.last_errno {
+                    Some(libc::ENOBUFS) => self.enobufs += 1,
+                    Some(libc::ECONNREFUSED) => self.refused += 1,
+                    _ if error.kind() == io::ErrorKind::WouldBlock => self.would_block += 1,
+                    _ => self.other += 1,
+                }
+            }
+        }
+        true
+    }
+}
+
+#[derive(Debug)]
+struct D4Report {
+    mono_ns: u64,
+    counts: D4Counts,
+}
+
+impl D4Report {
+    fn log(self, label: &str) {
+        let D4Report { mono_ns, counts: c } = self;
+        emit_log(&format!("AUDIO-D4: {label} monoNs={mono_ns} attempted={} sent={} writeErrors={} wouldBlock={} enobufs={} connectionRefused={} other={} shortWrite={} lastErrno={:?}",
+            c.attempted, c.sent, c.attempted - c.sent, c.would_block, c.enobufs, c.refused, c.other, c.short, c.last_errno));
+    }
+}
+
+pub(crate) struct D4Trace {
+    reports: mpsc::Sender<D4Report>,
+    final_report: Option<mpsc::OwnedPermit<D4Report>>,
+    counts: D4Counts,
+    last_report_ns: u64,
+    last_queued_attempts: u64,
+    saw_error: bool,
+}
+
+impl D4Trace {
+    pub(crate) fn start(rtsp: u64, stream_id: i64, kind: u8, peer_port: u16, socket_available: bool) -> Option<Self> {
+        let label = format!("RTSP#{rtsp} type={kind} streamConnectionID={stream_id} peerControlPort={peer_port}");
+        let mono = monotonic_nanos();
+        if !socket_available {
+            let reason = if peer_port == 0 { "no_control_port" } else { "socket_unavailable" };
+            emit_log(&format!("AUDIO-D4: {label} monoNs={mono} state={reason} attempted=0 sent=0 writeErrors=0"));
+            return None;
+        }
+        emit_log(&format!("AUDIO-D4: {label} monoNs={mono} state=ready"));
+        Some(Self::drain_reports(mono, move |report| report.log(&label)))
+    }
+
+    fn drain_reports(mono: u64, log: impl Fn(D4Report) + Send + 'static) -> Self {
+        let (trace, mut reports) = Self::report_queue(mono);
+        crate::callback_context::spawn(async move {
+            while let Some(report) = reports.recv().await {
+                log(report);
+            }
+        });
+        trace
+    }
+
+    fn report_queue(mono_ns: u64) -> (Self, mpsc::Receiver<D4Report>) {
+        let (reports, receiver) = mpsc::channel(D4_REPORTS_MAX_PENDING);
+        // A slow log consumer can drop intermediate snapshots. Reserve one slot
+        // so retiring a stream can always enqueue its latest totals without waiting.
+        let final_report = reports.clone().try_reserve_owned().expect("fresh D4 report queue has space");
+        (Self { reports, final_report: Some(final_report), counts: D4Counts::default(),
+            last_report_ns: mono_ns, last_queued_attempts: 0, saw_error: false }, receiver)
+    }
+
+    pub(crate) fn written(&mut self, result: &io::Result<usize>, bytes: usize) {
+        self.written_at(result, bytes, monotonic_nanos());
+    }
+
+    fn written_at(&mut self, result: &io::Result<usize>, bytes: usize, now: u64) {
+        let failed = self.counts.record(result, bytes);
+        // Capture the first failure immediately. Persistent failures and healthy
+        // traffic share the same bounded reporting interval.
+        if self.counts.attempted == 1 || failed && !self.saw_error ||
+            now.saturating_sub(self.last_report_ns) >= D4_LOG_INTERVAL_NS {
+            self.last_report_ns = now;
+            if self.reports.try_send(D4Report { mono_ns: now, counts: self.counts }).is_ok() {
+                self.last_queued_attempts = self.counts.attempted;
+            }
+        }
+        self.saw_error |= failed;
+    }
+}
+
+impl Drop for D4Trace {
+    fn drop(&mut self) {
+        if self.counts.attempted != self.last_queued_attempts {
+            if let Some(permit) = self.final_report.take() {
+                let _ = permit.send(D4Report { mono_ns: monotonic_nanos(), counts: self.counts });
+            }
+        }
+    }
+}
+
+/// One atomic read pairs the last original media write with its ownership
+/// generation. The reserved value also prevents stale comparisons after overflow.
+#[derive(Debug)]
+pub(crate) struct RtpPosition(AtomicU64);
+
+impl Default for RtpPosition {
+    fn default() -> Self { Self(AtomicU64::new(u64::MAX)) }
+}
+
+impl RtpPosition {
+    pub(crate) fn record(&self, losses: u64, timestamp: u32) {
+        if losses < u64::from(u32::MAX) {
+            self.0.store((losses << 32) | u64::from(timestamp), Ordering::Release);
+        }
+    }
+
+    fn read(&self, losses: u64) -> Option<u32> {
+        let packed = self.0.load(Ordering::Acquire);
+        (packed != u64::MAX && packed >> 32 == losses).then_some(packed as u32)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FeedbackSource {
+    pub(crate) target: ClockTarget,
+    pub(crate) high_accuracy: bool,
+    pub(crate) position: Weak<RtpPosition>,
+}
+
+pub(crate) struct FeedbackSnapshot {
+    source: FeedbackSource,
+    losses: u64,
+    written_rtp: Option<u32>,
+    mono_ns: u64,
+}
+
+impl FeedbackSource {
+    pub(crate) fn snapshot(&self, losses: u64) -> FeedbackSnapshot {
+        let written_rtp = self.position.upgrade().and_then(|position| position.read(losses));
+        FeedbackSnapshot { source: self.clone(), losses, written_rtp, mono_ns: monotonic_nanos() }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RtpObservation {
+    written: u32,
+    mono_ns: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct FeedbackTrace {
+    layout: String,
+    repeats: u64,
+    clock_target: Option<(ClockTarget, u64)>,
+    clock: SampleClock,
+    comparison: Option<(ClockTarget, RtpObservation, RtpObservation)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClockTarget {
+    pub(crate) rtsp: u64,
+    pub(crate) stream_id: i64,
+    pub(crate) stream_type: i64,
+    pub(crate) rate: u32,
+}
+
+#[derive(Default)]
+struct SampleClock {
+    previous: Option<(u32, u64)>,
+    origin_ns: u64,
+    frames_since_origin: u64,
+}
+
+impl SampleClock {
+    fn estimate(&mut self, stream: &Value, nominal_rate: u32) -> Option<(f64, i128)> {
+        let sample = u32::try_from(stream.get("sampleTime")?.as_int()?).ok()?;
+        let raw_ns = u64::try_from(stream.get("timestampRawNs")?.as_int()?).ok().filter(|n| *n != 0)?;
+        let Some((previous_sample, previous_ns)) = self.previous else {
+            self.reset(sample, raw_ns);
+            return None;
+        };
+        let Some(elapsed_ns) = raw_ns.checked_sub(previous_ns) else {
+            // Ignore reordered replies within the estimation window. Re-anchor
+            // after a large backward step so a restarted receiver clock recovers.
+            if previous_ns - raw_ns > 10_000_000_000 { self.reset(sample, raw_ns); }
+            return None;
+        };
+        if elapsed_ns < 100_000_000 { return None; }
+        let frames = u64::from(sample.wrapping_sub(previous_sample));
+        let rate = frames as f64 * 1e9 / elapsed_ns as f64;
+        let nominal = f64::from(nominal_rate);
+        if elapsed_ns > 10_000_000_000 || !(0.95 * nominal..=1.05 * nominal).contains(&rate) {
+            self.reset(sample, raw_ns);
+            return None;
+        }
+        self.previous = Some((sample, raw_ns));
+        self.frames_since_origin += frames;
+        // Phase relative to the first observed sample at nominal rate. The
+        // receiver's raw ticks have no shared epoch with the phone's clock.
+        let nominal_ns = i128::from(self.frames_since_origin) * 1_000_000_000 / i128::from(nominal_rate);
+        Some((rate, i128::from(raw_ns - self.origin_ns) - nominal_ns))
+    }
+
+    fn reset(&mut self, sample: u32, raw_ns: u64) {
+        *self = Self { previous: Some((sample, raw_ns)), origin_ns: raw_ns, frames_since_origin: 0 };
+    }
+}
+
+impl FeedbackTrace {
+    fn set_clock_target(&mut self, target: Option<(ClockTarget, u64)>) {
+        if self.clock_target != target {
+            self.clock_target = target;
+            self.clock = Default::default();
+        }
+    }
+
+    pub(crate) fn set_observation_snapshots(&mut self, before: Option<FeedbackSnapshot>, after: Option<FeedbackSnapshot>) {
+        let matching = before.zip(after).filter(|(before, after)| {
+            before.losses == after.losses && before.source.target == after.source.target &&
+                before.source.position.ptr_eq(&after.source.position)
+        });
+        self.set_clock_target(matching.as_ref().and_then(|(before, _)| {
+            before.source.high_accuracy.then_some((before.source.target, before.losses))
+        }));
+        self.comparison = matching.and_then(|(before, after)| {
+            Some((before.source.target,
+                RtpObservation { written: before.written_rtp?, mono_ns: before.mono_ns },
+                RtpObservation { written: after.written_rtp?, mono_ns: after.mono_ns }))
+        });
+    }
+
+    pub(crate) fn observe(&mut self, rtsp: u64, cseq: Option<i32>, body: &[u8]) -> Option<String> {
+        let mut layout = String::new();
+        let mut rows = Vec::new();
+        if body.is_empty() { layout.push_str("empty_body"); }
+        else if body.len() > 65536 { layout.push_str("body_over_64KiB"); }
+        else if let Ok(plist) = bplist::parse(body) {
+            if let Some(streams) = plist.get("streams").and_then(Value::as_array) {
+                let estimate = self.clock_target.and_then(|(target, _)| {
+                    if target.rtsp != rtsp || target.rate == 0 { return None; }
+                    let stream = unique_stream(streams, target)?;
+                    self.clock.estimate(stream, target.rate).map(|estimate| (target, estimate))
+                });
+                let comparison = self.comparison.and_then(|(target, sent_before, sent_after)| {
+                    if target.rtsp != rtsp || target.rate == 0 { return None; }
+                    let stream = unique_stream(streams, target)?;
+                    let rate = f64::from(target.rate);
+                    if feedback_rate(stream).is_some_and(|rate_field| !(0.95 * rate..=1.05 * rate).contains(&rate_field)) {
+                        return None;
+                    }
+                    let received = u32::try_from(stream.get("sampleTime")?.as_int()?).ok()?;
+                    let before_delta = sent_before.written.wrapping_sub(received) as i32;
+                    let after_delta = sent_after.written.wrapping_sub(received) as i32;
+                    if [before_delta, after_delta].contains(&i32::MIN) { return None; }
+                    Some((target, sent_before, sent_after, before_delta, after_delta))
+                });
+                layout.push_str("no_audio_stream");
+                for stream in streams {
+                    let Some(kind @ 100..=103) = stream.get("type").and_then(Value::as_int) else { continue; };
+                    if rows.is_empty() { layout.clear(); }
+                    if rows.len() == 8 {
+                        layout.push_str(" more");
+                        rows.push("additional_streams_omitted".into());
+                        break;
+                    }
+                    let id = stream.get("streamConnectionID").and_then(Value::as_int);
+                    let mut row = match id {
+                        Some(id) => format!("type={kind} streamConnectionID={id}"),
+                        None => format!("type={kind} streamConnectionID=unknown attribution=unknown"),
+                    };
+                    layout.push_str(&format!(" {kind}/{id:?}"));
+                    for field in ["sr", "mediaTime", "wallTime", "sampleTime", "timestamp", "timestampRawNs"] {
+                        let value = if field == "sr" { feedback_rate_value(stream) } else { stream.get(field) };
+                        let number = match value {
+                            Some(Value::Int(n)) => Some(n.to_string()),
+                            Some(Value::Real(n)) if n.is_finite() => Some(n.to_string()),
+                            _ => None,
+                        };
+                        layout.push(if number.is_some() { '+' } else { '-' });
+                        row.push_str(&format!(" {field}={}", number.as_deref().unwrap_or("NA")));
+                    }
+                    if let Some((_, (rate, offset))) = estimate.filter(|(target, _)|
+                        kind == target.stream_type && id == Some(target.stream_id)) {
+                        layout.push_str(" clock");
+                        row.push_str(&format!(" rateHz={rate:.3} sampleClockOffsetNs={offset}"));
+                    }
+                    if let Some((_, before, after, ahead_before, ahead_after)) = comparison.filter(|(target, ..)|
+                        kind == target.stream_type && id == Some(target.stream_id)) {
+                        layout.push_str(" rtp_comparison");
+                        row.push_str(&format!(" beforeQueueMonoNs={} afterObservationMonoNs={} writtenRtpBeforeQueue={} writtenRtpAfterObservation={} writtenAheadFramesBeforeQueue={ahead_before} writtenAheadFramesAfterObservation={ahead_after}",
+                            before.mono_ns, after.mono_ns, before.written, after.written));
+                    }
+                    rows.push(row);
+                }
+            } else { layout.push_str("missing_or_invalid_streams"); }
+        } else { layout.push_str("invalid_plist"); }
+        if self.layout != layout {
+            self.layout = layout;
+            self.repeats = 0;
+        }
+        self.repeats += 1;
+        // Capture a consecutive pair when fields first appear, then sample steady replies.
+        if self.repeats > 2 && self.repeats % 10 != 0 { return None; }
+        let detail = if rows.is_empty() {
+            format!("{} streamConnectionID=unknown attribution=unknown", self.layout)
+        } else { rows.join(" | ") };
+        Some(format!("AUDIO-FEEDBACK: RTSP#{rtsp} CSeq={cseq:?} monoNs={} bodyBytes={} {detail}", monotonic_nanos(), body.len()))
+    }
+}
+
+fn unique_stream(streams: &[Value], target: ClockTarget) -> Option<&Value> {
+    let mut matches = streams.iter().filter(|stream| {
+        stream.get("type").and_then(Value::as_int) == Some(target.stream_type) &&
+            stream.get("streamConnectionID").and_then(Value::as_int) == Some(target.stream_id)
+    });
+    let stream = matches.next()?;
+    matches.next().is_none().then_some(stream)
+}
+
+fn rate_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int(rate) if *rate > 0 => Some(*rate as f64),
+        Value::Real(rate) if rate.is_finite() && *rate > 0.0 => Some(*rate),
+        _ => None,
+    }
+}
+
+fn feedback_rate_value(stream: &Value) -> Option<&Value> {
+    ["sr", "sampleRate"].into_iter().filter_map(|key| stream.get(key)).find(|value| rate_number(value).is_some())
+}
+
+fn feedback_rate(stream: &Value) -> Option<f64> {
+    feedback_rate_value(stream).and_then(rate_number)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resend_evidence_requires_the_full_request_and_nonzero_count() {
+        let request = [0x80, 0xd5, 0, 1, 0xff, 0xff, 0, 2];
+        assert_eq!(resend_request(&request), Some((1, 65535, 2)));
+        for n in 0..8 { assert_eq!(resend_request(&request[..n]), None); }
+        for (i, v) in [(0, 0x40), (1, 0xd6), (3, 0), (3, 2), (7, 0)] {
+            let mut invalid = request;
+            invalid[i] = v;
+            assert_eq!(resend_request(&invalid), None);
+        }
+        assert_eq!(resend_request(&[0x80, 0xd5, 0, 1, 0, 2, 0, 3, 4]), None);
+        let extended = [0x80, 0xd5, 0, 3, 0xff, 0xff, 0, 2, 1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(resend_request(&extended), Some((3, 65535, 2)));
+        assert_eq!(resend_request(&extended[..15]), None);
+    }
+
+    #[tokio::test]
+    async fn resend_cache_expires_packets_and_bounds_each_request() {
+        let ownership = crate::buffered_ownership::BufferedOwnership::default();
+        ownership.publish(true);
+        let cache = ResendCache::new(ownership.subscribe(), CACHE_PACKETS);
+        let generation = cache.generation().unwrap();
+        for seq in 0..=CACHE_PACKETS as u16 {
+            cache.remember(seq, generation, vec![0x80, 0x66]);
+        }
+        assert!(cache.response(0, generation).is_none());
+        cache.packets.lock().front_mut().unwrap().sent_at = Instant::now() - CACHE_AGE - Duration::from_millis(1);
+        assert!(cache.response(1, generation).is_none());
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(peer.local_addr().unwrap()).await.unwrap();
+        let mut budget = 2;
+        let result = resend(&socket, None, &cache, 2, u16::MAX, &mut budget);
+        assert_eq!((result.hits, result.sent, result.misses, result.send_errors), (16, 2, 0, 0));
+        assert_eq!(result.skipped, u64::from(u16::MAX) - 2);
+        assert_eq!(budget, 0);
+    }
+
+    #[tokio::test]
+    async fn listener_without_peer_port_accepts_extended_request_only_from_session_address() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let address = local.local_addr().unwrap();
+        let ownership = crate::buffered_ownership::BufferedOwnership::default();
+        ownership.publish(true);
+        let observer = ControlObserver::start(local, "PCM test".into(), ownership.subscribe(), true,
+            Some(peer.local_addr().unwrap().ip()));
+        observer.remember_sent(9, observer.generation().unwrap(), vec![0x80, 100, 0, 9]);
+        let request = [0x80, 0xd5, 0, 3, 0, 9, 0, 1, 1, 2, 3, 4, 5, 6, 7, 8];
+        other.send_to(&request, address).await.unwrap();
+        peer.send_to(&request, address).await.unwrap();
+        let mut buf = [0; 16];
+        let (n, origin) = tokio::time::timeout(Duration::from_secs(1), peer.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(origin, address);
+        assert_eq!(&buf[..n], &[0x80, 0xd6, 4, 0, 0x80, 100, 0, 9]);
+        assert!(tokio::time::timeout(Duration::from_millis(20), other.recv(&mut buf)).await.is_err());
+        assert_eq!(observer.requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn connected_control_socket_ignores_other_peers_and_logs_cache_misses() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        local.connect(peer.local_addr().unwrap()).await.unwrap();
+        let addr = local.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let count = Arc::new(AtomicU64::new(0));
+        let ownership = crate::buffered_ownership::BufferedOwnership::default();
+        ownership.publish(true);
+        let cache = Arc::new(ResendCache::new(ownership.subscribe(), CACHE_PACKETS));
+        let reader = tokio::spawn(observe_control(local.clone(), None, "RTSP#9".into(), count.clone(),
+            cache, Arc::new(Mutex::new(ResendTotals::default())),
+            move |line| { tx.send(line.to_owned()).unwrap(); }));
+        other.send_to(&[0x80, 0xd5, 0, 1, 0, 0, 0, 9], addr).await.unwrap();
+        peer.send_to(&[0x80, 0xd5, 0, 1, 0, 1, 0, 2], addr).await.unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        assert!(line.contains("RTSP#9 RX=0xD5") && line.contains("firstMissingSeq=1 count=2"));
+        assert!(line.contains("lengthWordsMinusOne=1") && !line.contains("requestSeq"));
+        assert!(line.contains("cacheHits=0 cacheMisses=2 d6Sent=0 d6SendErrors=0"));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        for seq in [1u8, 2] {
+            let mut response = [0; 16];
+            let n = tokio::time::timeout(Duration::from_secs(1), peer.recv(&mut response)).await.unwrap().unwrap();
+            assert_eq!(&response[..n], &[0x80, 0xd6, 4, 0, 0, seq, 0, 0]);
+        }
+        assert_eq!(local.send(&[0x80, 0xd4]).await.unwrap(), 2);
+        let mut sync = [0; 16];
+        let (n, source) = peer.recv_from(&mut sync).await.unwrap();
+        assert_eq!((&sync[..n], source), (&[0x80, 0xd4][..], addr));
+        reader.abort();
+        let _ = reader.await;
+    }
+
+    #[test]
+    fn feedback_keeps_raw_clock_values_separate_and_reports_new_fields_immediately() {
+        let mut trace = FeedbackTrace::default();
+        for _ in 0..2 { assert!(trace.observe(1, Some(2), &[]).unwrap().contains("empty_body")); }
+        assert!(trace.observe(1, Some(3), &[]).is_none());
+        let response = |streams| bplist::encode(&Value::dict(vec![("streams", Value::array(streams))]));
+        let video = Value::dict(vec![("type", Value::int(110))]);
+        assert!(trace.observe(1, None, &response(vec![video])).unwrap().contains("no_audio_stream"));
+        let primary = Value::dict(vec![("type", Value::int(102)), ("streamConnectionID", Value::int(42)),
+            ("sr", Value::real(47999.75)), ("mediaTime", Value::int(512)), ("wallTime", Value::int(9007199254740993))]);
+        let alternate = Value::dict(vec![("type", Value::int(103)), ("sr", Value::int(48000)),
+            ("sampleTime", Value::int(0)), ("timestamp", Value::int(4294967295)), ("timestampRawNs", Value::int(123456))]);
+        let body = response(vec![primary, alternate]);
+        let line = trace.observe(1, Some(8), &body).unwrap();
+        assert!(line.contains("RTSP#1 CSeq=Some(8)"));
+        assert!(line.contains("type=102 streamConnectionID=42 sr="));
+        assert!(line.contains("type=103 streamConnectionID=unknown attribution=unknown sr="));
+        assert!(line.contains("sr=47999.75 mediaTime=512 wallTime=9007199254740993 sampleTime=NA"));
+        assert!(line.contains("type=103") && line.contains("sr=48000 mediaTime=NA wallTime=NA sampleTime=0 timestamp=4294967295 timestampRawNs=123456"));
+        assert!(trace.observe(1, None, &body).is_some());
+        assert!(trace.observe(1, None, &body).is_none());
+        assert!(FeedbackTrace::default().observe(2, Some(1), &body).unwrap().contains("RTSP#2"));
+        assert!(trace.observe(1, None, b"broken").unwrap().contains("invalid_plist streamConnectionID=unknown attribution=unknown"));
+    }
+
+    #[test]
+    fn feedback_reports_diplay_sample_rate_as_the_rtp_clock_rate() {
+        let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![Value::dict(vec![
+            ("type", Value::int(100)), ("streamConnectionID", Value::int(42)),
+            ("sampleRate", Value::int(48_000)), ("sampleTime", Value::int(73_728)),
+        ])]))]));
+        let line = FeedbackTrace::default().observe(1, Some(1), &body).unwrap();
+        assert!(line.contains("sr=48000"), "{line}");
+    }
+
+    #[test]
+    fn d4_write_totals_distinguish_udp_errors_and_do_not_count_short_writes_as_sent() {
+        let mut counts = D4Counts::default();
+        assert!(!counts.record(&Ok(20), 20));
+        assert!(counts.record(&Ok(19), 20));
+        for errno in [libc::EAGAIN, libc::ENOBUFS, libc::ECONNREFUSED, libc::EPIPE] {
+            assert!(counts.record(&Err(io::Error::from_raw_os_error(errno)), 20));
+        }
+        assert_eq!((counts.attempted, counts.sent, counts.short, counts.would_block, counts.enobufs, counts.refused, counts.other),
+            (6, 1, 1, 1, 1, 1, 1));
+        assert_eq!(counts.last_errno, Some(libc::EPIPE));
+    }
+
+    #[test]
+    fn d4_keeps_final_totals_when_periodic_reports_fill_the_queue() {
+        let start = monotonic_nanos();
+        let (mut trace, mut reports) = D4Trace::report_queue(start);
+        let sent = Ok(20);
+        let refused = Err(io::Error::from_raw_os_error(libc::ECONNREFUSED));
+        trace.written_at(&sent, 20, start);
+        trace.written_at(&refused, 20, start + 1);
+        trace.written_at(&sent, 20, start + 2);
+        trace.written_at(&sent, 20, start + D4_LOG_INTERVAL_NS + 1);
+        trace.written_at(&sent, 20, start + 2 * D4_LOG_INTERVAL_NS + 1);
+        drop(trace);
+
+        let attempts: Vec<_> = std::iter::from_fn(|| reports.try_recv().ok()).map(|report| {
+            (report.counts.attempted, report.counts.sent, report.counts.refused)
+        }).collect();
+        assert_eq!(attempts, vec![(1, 1, 0), (2, 1, 1), (4, 3, 1), (5, 4, 1)]);
+        assert_eq!(reports.try_recv().unwrap_err(), mpsc::error::TryRecvError::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn d4_drains_final_totals_with_the_retired_engines_callback_context() {
+        use crate::callback_context::{current, sync_scope, Context};
+
+        let owner = Context::new(None);
+        let owner_generation = owner.generation;
+        let start = monotonic_nanos();
+        let (seen, mut observations) = mpsc::unbounded_channel();
+        let mut trace = sync_scope(owner, || D4Trace::drain_reports(start, move |report| {
+            seen.send((current().map(|context| context.generation), report.counts.attempted)).unwrap();
+        }));
+        trace.written_at(&Ok(20), 20, start);
+        trace.written_at(&Ok(20), 20, start + 1);
+        // Retire the old stream before the single-threaded runtime first polls its log task.
+        sync_scope(Context::new(None), || drop(trace));
+
+        let observed = async {
+            let mut rows = Vec::new();
+            while let Some(report) = observations.recv().await { rows.push(report); }
+            rows
+        };
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), observed).await.unwrap(),
+            [(Some(owner_generation), 1), (Some(owner_generation), 2)]);
+    }
+
+    #[test]
+    fn feedback_compares_both_sides_of_the_request_only_for_the_same_stream_and_ownership() {
+        let position = Arc::new(RtpPosition::default());
+        let source = FeedbackSource { target: ClockTarget { rtsp: 1, stream_id: 42, stream_type: 100, rate: 48_000 },
+            high_accuracy: false, position: Arc::downgrade(&position) };
+        let row = |id, rate| Value::dict(vec![("type", Value::int(100)), ("streamConnectionID", Value::int(id)),
+            ("sampleRate", Value::int(rate)), ("sampleTime", Value::int(i64::from(u32::MAX) - 99))]);
+        let body = |rows| bplist::encode(&Value::dict(vec![("streams", Value::array(rows))]));
+        let mut trace = FeedbackTrace::default();
+
+        position.record(7, u32::MAX - 119);
+        let before = source.snapshot(7);
+        position.record(7, 100);
+        let after = source.snapshot(7);
+        let (before_ns, after_ns) = (before.mono_ns, after.mono_ns);
+        trace.set_observation_snapshots(Some(before), Some(after));
+        let line = trace.observe(1, Some(1), &body(vec![row(42, 48_000), row(43, 48_000)])).unwrap();
+        assert!(line.contains("writtenAheadFramesBeforeQueue=-20 writtenAheadFramesAfterObservation=200"), "{line}");
+        assert!(line.contains(&format!("beforeQueueMonoNs={before_ns} afterObservationMonoNs={after_ns}")), "{line}");
+        assert_eq!(line.matches("writtenRtpBeforeQueue=").count(), 1);
+        for invalid in [vec![row(42, 16_000)], vec![row(42, 48_000), row(42, 48_000)], vec![row(43, 48_000)]] {
+            assert!(!trace.observe(1, Some(2), &body(invalid)).unwrap().contains("writtenRtpBeforeQueue="));
+        }
+
+        let before = source.snapshot(7);
+        position.record(8, 200);
+        trace.set_observation_snapshots(Some(before), Some(source.snapshot(8)));
+        assert!(trace.comparison.is_none());
+        assert!(source.snapshot(7).written_rtp.is_none());
+        let replacement = Arc::new(RtpPosition::default());
+        replacement.record(8, 400);
+        let reused_id = FeedbackSource { position: Arc::downgrade(&replacement), ..source.clone() };
+        trace.set_observation_snapshots(Some(source.snapshot(8)), Some(reused_id.snapshot(8)));
+        assert!(trace.comparison.is_none());
+    }
+
+    #[test]
+    fn feedback_without_an_id_after_rebuild_never_inherits_the_previous_main_stream() {
+        let mut trace = FeedbackTrace::default();
+        for (rtsp, cseq, id) in [(3, 10, Some(91)), (3, 12, Some(92)), (3, 13, None), (4, 1, None)] {
+            let mut fields = vec![("type", Value::int(102))];
+            if let Some(id) = id { fields.push(("streamConnectionID", Value::int(id))); }
+            let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![Value::dict(fields)]))]));
+            let line = trace.observe(rtsp, Some(cseq), &body).unwrap();
+            assert!(line.contains(&format!("RTSP#{rtsp} CSeq=Some({cseq})")));
+            match id {
+                Some(n) => assert!(line.contains(&format!("streamConnectionID={n} "))),
+                None => assert!(line.contains("type=102 streamConnectionID=unknown attribution=unknown")),
+            }
+        }
+    }
+
+    #[test]
+    fn high_accuracy_feedback_tracks_only_the_current_unique_stream_and_handles_sample_wrap() {
+        let body = |rows: &[(i64, i64, i64)]| bplist::encode(&Value::dict(vec![
+            ("streams", Value::array(rows.iter().map(|&(id, sample, raw)| Value::dict(vec![
+                ("type", Value::int(102)), ("streamConnectionID", Value::int(id)),
+                ("sampleTime", Value::int(sample)), ("timestampRawNs", Value::int(raw)),
+            ])).collect())),
+        ]));
+        let mut trace = FeedbackTrace::default();
+        trace.set_clock_target(Some((ClockTarget { rtsp: 3, stream_id: 91, stream_type: 102, rate: 48_000 }, 0)));
+        let start = (1i64 << 32) - 24_000;
+        let raw = 9_007_199_254_740_995;
+        assert!(!trace.observe(3, Some(1), &body(&[(91, start, raw)])).unwrap().contains("rateHz="));
+        let line = trace.observe(3, Some(2), &body(&[(91, 24_048, raw + 1_000_000_000)])).unwrap();
+        assert!(line.contains("rateHz=48048.000 sampleClockOffsetNs=-1000000"), "{line}");
+        let duplicate = trace.observe(3, Some(3), &body(&[(91, 72_096, raw + 2_000_000_000); 2])).unwrap();
+        assert!(!duplicate.contains("rateHz="));
+        trace.set_clock_target(Some((ClockTarget { rtsp: 3, stream_id: 92, stream_type: 102, rate: 48_000 }, 1)));
+        let retired = trace.observe(3, Some(4), &body(&[(91, 72_096, raw + 2_000_000_000)])).unwrap();
+        assert!(!retired.contains("rateHz="));
+        let replaced = trace.observe(3, Some(5), &body(&[(92, 72_096, raw + 2_000_000_000)])).unwrap();
+        assert!(!replaced.contains("rateHz="));
+        let implausible = trace.observe(3, Some(6), &body(&[(92, 2, raw + 3_000_000_000)])).unwrap();
+        assert!(!implausible.contains("rateHz="));
+    }
+
+    #[test]
+    fn high_accuracy_feedback_recovers_after_a_receiver_clock_reset() {
+        let stream = |sample, raw| Value::dict(vec![("sampleTime", Value::int(sample)), ("timestampRawNs", Value::int(raw))]);
+        let mut clock = SampleClock::default();
+        assert_eq!(clock.estimate(&stream(48_000, 30_000_000_000), 48_000), None);
+        assert_eq!(clock.estimate(&stream(1, 29_000_000_000), 48_000), None);
+        assert_eq!(clock.estimate(&stream(96_000, 31_000_000_000), 48_000), Some((48_000.0, 0)));
+        assert_eq!(clock.estimate(&stream(0, 1_000_000_000), 48_000), None);
+        assert_eq!(clock.estimate(&stream(48_000, 2_000_000_000), 48_000), Some((48_000.0, 0)));
+    }
+}
