@@ -2,6 +2,7 @@ package io.github.hypercar.update
 
 import android.content.Context
 import io.github.hypercar.BuildConfig
+import io.github.hypercar.settings.SettingsStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -72,31 +73,55 @@ object UpdateCenter {
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    /**
-     * 查询最新 Release 并与本地版本比较。
-     * @param force 手动检查：忽略 6 小时间隔（但仍会写入检查时间）
-     */
-    suspend fun check(context: Context) = withContext(Dispatchers.IO) {
-        _state.value = UpdateUiState.Checking
-        prefs(context).edit().putLong(KEY_LAST_CHECK, System.currentTimeMillis()).apply()
-        _state.value = try {
-            val latest = fetchLatest(context)
-            when {
-                latest == null -> UpdateUiState.Failed("仓库还没有发布任何 Release")
-                isNewer(latest.version, currentVersion) -> UpdateUiState.Available(latest)
-                else -> UpdateUiState.UpToDate(latest.version)
+    private val checkLock = Any()
+    private var checkGeneration = 0L
+
+    suspend fun setReceiveAlphaUpdates(context: Context, enabled: Boolean) {
+        synchronized(checkLock) {
+            SettingsStore.receiveAlphaUpdates = enabled
+            checkGeneration++
+            _state.value = UpdateUiState.Idle
+        }
+        check(context, clearDismissed = true)
+    }
+
+    /** 手动检查不受自动检查间隔限制；渠道切换使旧请求立即失效。 */
+    suspend fun check(context: Context, clearDismissed: Boolean = false) {
+        val (generation, receiveAlpha) = synchronized(checkLock) {
+            (++checkGeneration to SettingsStore.receiveAlphaUpdates).also {
+                _state.value = UpdateUiState.Checking
             }
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            UpdateUiState.Failed(e.message ?: "检查失败")
+        }
+        withContext(Dispatchers.IO) {
+            val editor = prefs(context).edit()
+            synchronized(checkLock) {
+                if (generation != checkGeneration) return@withContext
+                editor.putLong(KEY_LAST_CHECK, System.currentTimeMillis())
+                if (clearDismissed) editor.remove(KEY_DISMISSED)
+                editor.apply()
+            }
+            val result = try {
+                val latest = fetchLatest(context, receiveAlpha)
+                when {
+                    latest == null -> UpdateUiState.Failed("所选渠道暂无可用的 Release")
+                    isNewer(latest.version, currentVersion) -> UpdateUiState.Available(latest)
+                    else -> UpdateUiState.UpToDate(latest.version)
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                UpdateUiState.Failed(e.message ?: "检查失败")
+            }
+            synchronized(checkLock) {
+                if (generation == checkGeneration) _state.value = result
+            }
         }
     }
 
-    private suspend fun fetchLatest(context: Context): ReleaseInfo? = withContext(Dispatchers.IO) {
+    private suspend fun fetchLatest(context: Context, receiveAlpha: Boolean): ReleaseInfo? = withContext(Dispatchers.IO) {
         // 会话期间进程被绑到车机热点（无外网）——必须挑一条真有外网的网络，
         // 否则「检查更新」100% 失败（2026-10-25 验证）。
-        val conn = io.github.hypercar.net.InternetRoute.open(context, releaseApiUrl(currentVersion)).apply {
+        val conn = io.github.hypercar.net.InternetRoute.open(context, releaseApiUrl(receiveAlpha)).apply {
             requestMethod = "GET"
             setRequestProperty("Accept", "application/vnd.github+json")
             // GitHub 要求带 User-Agent，否则 403
@@ -111,7 +136,7 @@ object UpdateCenter {
             }
             if (code !in 200..299) throw IllegalStateException("GitHub 返回 HTTP $code")
 
-            parseLatestRelease(conn.inputStream.bufferedReader().use { it.readText() }, currentVersion)
+            parseLatestRelease(conn.inputStream.bufferedReader().use { it.readText() }, receiveAlpha)
         } finally {
             conn.disconnect()
         }
@@ -124,33 +149,40 @@ object UpdateCenter {
 internal fun isAlphaVersion(version: String): Boolean =
     Regex("-alpha\\.[0-9]+(?:\\+.*)?$").containsMatchIn(version)
 
-internal fun releaseApiUrl(currentVersion: String): String {
+internal fun resolveReceiveAlphaUpdates(stored: Boolean?, currentVersion: String): Boolean =
+    stored ?: isAlphaVersion(currentVersion)
+
+internal fun releaseApiUrl(receiveAlpha: Boolean): String {
     val releases = "https://api.github.com/repos/StrivingRabbit/colorplay-next/releases"
-    return if (isAlphaVersion(currentVersion)) "$releases?per_page=100" else "$releases/latest"
+    return if (receiveAlpha) "$releases?per_page=100" else "$releases/latest"
 }
 
 private val alphaTag = Regex("v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-alpha\\.(0|[1-9][0-9]*)")
+private val stableTag = Regex("[vV]?[0-9]+(?:\\.[0-9]+)*")
 
-/** alpha 只读取自己的预发布流，正式版只读取 latest，均不回退到另一渠道。 */
-internal fun parseLatestRelease(payload: String, currentVersion: String): ReleaseInfo? {
-    val json = if (isAlphaVersion(currentVersion)) {
+private fun eligibleRelease(json: JSONObject, receiveAlpha: Boolean): Boolean {
+    if (json.optBoolean("draft")) return false
+    val tag = json.optString("tag_name")
+    return if (json.optBoolean("prerelease")) receiveAlpha && alphaTag.matches(tag)
+    else stableTag.matches(tag)
+}
+
+/** 开启测试版时比较所有合法可下载的正式版和 Alpha；关闭时只接受 latest 正式版。 */
+internal fun parseLatestRelease(payload: String, receiveAlpha: Boolean): ReleaseInfo? {
+    val json = if (receiveAlpha) {
         val releases = JSONArray(payload)
         (0 until releases.length()).mapNotNull { releases.optJSONObject(it) }
             .filter {
-                !it.optBoolean("draft") && it.optBoolean("prerelease") &&
-                    alphaTag.matches(it.optString("tag_name")) && releaseApk(it, requireUploaded = true) != null
+                eligibleRelease(it, receiveAlpha = true) && releaseApk(it, requireUploaded = true) != null
             }
             .maxWithOrNull { a, b ->
                 compareReleaseVersions(a.getString("tag_name"), b.getString("tag_name")) ?: 0
             }
     } else {
-        JSONObject(payload).takeUnless {
-            it.optBoolean("draft") || it.optBoolean("prerelease") ||
-                isAlphaVersion(it.optString("tag_name"))
-        }
+        JSONObject(payload).takeIf { eligibleRelease(it, receiveAlpha = false) }
     } ?: return null
     val tag = json.optString("tag_name").ifBlank { return null }
-    val apk = releaseApk(json, requireUploaded = isAlphaVersion(currentVersion))
+    val apk = releaseApk(json, requireUploaded = receiveAlpha)
     return ReleaseInfo(
         tag = tag,
         version = tag.removePrefix("v").removePrefix("V"),

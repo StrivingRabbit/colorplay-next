@@ -28,6 +28,8 @@ import com.kyant.backdrop.effects.vibrancy
 import com.kyant.backdrop.highlight.Highlight
 import com.kyant.backdrop.highlight.HighlightStyle
 import com.kyant.backdrop.shadow.Shadow
+import com.kyant.backdrop.shadow.InnerShadow
+import androidx.compose.ui.unit.DpOffset
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -48,6 +50,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -75,22 +79,33 @@ fun Modifier.liquidGlassSurface(
         drawBackdrop(
             backdrop = backdrop,
             shape = { shape },
-            // Explicit weak directional reflection, not the library's full-strength default ring.
-            highlight = { Highlight(width = 0.6.dp, blurRadius = 0.8.dp, alpha = 0.38f,
-                style = HighlightStyle.Default(intensity = 0.24f, angle = 60f, falloff = 2f)) },
+            // 只保留弱方向反光，不使用库默认的整圈高亮。
+            highlight = { Highlight(width = 1.1.dp, blurRadius = 0.7.dp, alpha = if (dark) 0.65f else 0.55f,
+                style = HighlightStyle.Default(intensity = 0.40f, angle = 55f, falloff = 2.4f)) },
             shadow = { Shadow(radius = if (dark) 12.dp else 8.dp,
                 color = Color.Black.copy(alpha = if (dark) 0.24f else 0.07f)) },
-            innerShadow = null,
+            innerShadow = { InnerShadow(radius = 3.dp, offset = DpOffset(0.dp, 1.dp),
+                color = Color.Black.copy(alpha = if (dark) 0.16f else 0.065f)) },
             effects = {
                 vibrancy()
                 blur(blurRadius.toPx())
                 lens(
                     refractionHeight = refractionHeight.toPx(),
                     refractionAmount = refractionAmount.toPx(),
+                    depthEffect = true,
                     chromaticAberration = false,
                 )
             },
-            onDrawSurface = { drawRect(tint) },
+            onDrawSurface = {
+                drawRect(tint)
+                drawRect(Brush.linearGradient(
+                    0f to Color.White.copy(alpha = if (dark) 0.035f else 0.055f),
+                    0.45f to Color.Transparent,
+                    1f to Color.Transparent,
+                    start = Offset.Zero,
+                    end = Offset(size.width, size.height),
+                ))
+            },
         )
     } else {
         // 独立预览未提供采样层时，仍保留可读的透明表面。
@@ -110,8 +125,12 @@ fun Modifier.glassPanel(
     return this
         .liquidGlassSurface(
             shape = shape,
-            tint = if (dark) Color(0xFF8BA5BB).copy(alpha = 0.14f) else Color.White.copy(alpha = 0.48f),
+            tint = if (dark) Color(0xFF8BA5BB).copy(alpha = 0.10f) else Color.White.copy(alpha = 0.27f),
+            blurRadius = if (dark) 6.dp else 5.dp,
+            refractionHeight = 18.dp,
+            refractionAmount = 26.dp,
         )
+        // 裁剪仅作用于后续子内容，不能放在采样绘制之前裁掉玻璃边缘与轻阴影。
         .clip(shape)
 }
 

@@ -7,6 +7,10 @@ use tokio::{net::{TcpListener,TcpStream,UdpSocket},sync::mpsc,io::{AsyncReadExt,
 
 struct Factory { receive: bool }
 impl SocketProvider for Factory {
+    #[cfg(not(target_os = "android"))]
+    fn aac_encoder_for_test(&self, sample_rate: u32) -> std::io::Result<crate::aac::AacEncoder> {
+        Ok(crate::aac::AacEncoder::fake_for_test(sample_rate))
+    }
     fn open_tcp(&self,_:&str,_:u16,_:u32)->Option<TcpStream>{None}
     fn open_udp(&self,host:&str,port:u16)->Option<UdpSocket>{
         let socket=std::net::UdpSocket::bind("127.0.0.1:0").ok()?;

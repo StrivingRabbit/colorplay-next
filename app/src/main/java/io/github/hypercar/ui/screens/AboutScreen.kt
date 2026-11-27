@@ -26,6 +26,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -43,6 +44,7 @@ import io.github.hypercar.UpstreamBase
 import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.ui.components.CapsuleButton
 import io.github.hypercar.ui.components.GlassPanel
+import io.github.hypercar.ui.components.GlassSwitch
 import io.github.hypercar.ui.components.InfoRow
 import io.github.hypercar.ui.components.SectionLabel
 import io.github.hypercar.ui.theme.CoralError
@@ -70,6 +72,7 @@ fun AboutScreen(modifier: Modifier = Modifier) {
     val checking = state is UpdateUiState.Checking
     var versionTaps by remember { mutableIntStateOf(0) }
     var lastVersionTap by remember { mutableLongStateOf(0L) }
+    var receiveAlpha by remember { mutableStateOf(SettingsStore.receiveAlphaUpdates) }
 
     Column(
         modifier = modifier
@@ -154,6 +157,30 @@ fun AboutScreen(modifier: Modifier = Modifier) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SectionLabel(text = "更新")
             GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "接收 Alpha 测试版更新",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextPrimary,
+                    )
+                    GlassSwitch(
+                        checked = receiveAlpha,
+                        onCheckedChange = { enabled ->
+                            receiveAlpha = enabled
+                            scope.launch { UpdateCenter.setReceiveAlphaUpdates(context, enabled) }
+                        },
+                    )
+                }
+                Text(
+                    text = "开启后可检查正式版与 Alpha 测试版，不会自动安装。Alpha 可能存在连接不稳定、功能异常等风险，请谨慎选择。关闭后仅检查正式版；已安装 Alpha 不会降级，需等待版本更高的正式版才能回到正式渠道。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                )
+                Spacer(modifier = Modifier.height(10.dp))
                 Text(
                     text = "检查更新仅更新 ColorPlay Next APK，不会直接安装或更新 HyperCar 底座。新底座需由开发者合并上游代码、完成测试并重新签名发布；可通过上方链接查看上游仓库与已导入提交。",
                     style = MaterialTheme.typography.bodySmall,
@@ -188,7 +215,8 @@ fun AboutScreen(modifier: Modifier = Modifier) {
                     }
 
                     is UpdateUiState.UpToDate -> Text(
-                        text = "已是最新版本（${s.latest}）",
+                        text = if (s.latest == UpdateCenter.currentVersion) "已是最新版本（${s.latest}）"
+                            else "当前 ${UpdateCenter.currentVersion}；所选渠道最新 ${s.latest}，无需更新。",
                         style = MaterialTheme.typography.bodySmall,
                         color = TextSecondary,
                     )

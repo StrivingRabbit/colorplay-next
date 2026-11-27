@@ -141,13 +141,22 @@ fun HyperCarBackground(modifier: Modifier = Modifier) {
     val p = LocalAppPalette.current
     Canvas(modifier = modifier.fillMaxSize()) {
         drawRect(base)
-        if (p.dark) {
-            drawRect(Brush.radialGradient(
-                listOf(p.accent.copy(alpha = 0.10f), Color.Transparent),
-                center = Offset(size.width * 0.92f, -size.height * 0.05f), radius = size.width * 0.85f))
-            drawRect(Brush.radialGradient(
-                listOf(p.secondary.copy(alpha = 0.13f), Color.Transparent),
-                center = Offset(-size.width * 0.10f, size.height * 1.05f), radius = size.width * 0.95f))
-        }
+        // 背景色池与柔光带为玻璃提供真实采样细节，浅色不再是无法辨认折射的纯色。
+        drawRect(Brush.radialGradient(
+            listOf(p.accent.copy(alpha = if (p.dark) 0.18f else 0.17f), Color.Transparent),
+            center = Offset(size.width * 0.92f, size.height * 0.12f), radius = size.width * 0.80f))
+        drawRect(Brush.radialGradient(
+            listOf(p.secondary.copy(alpha = if (p.dark) 0.20f else 0.16f), Color.Transparent),
+            center = Offset(size.width * 0.02f, size.height * 0.68f), radius = size.width * 0.72f))
+        drawRect(Brush.linearGradient(
+            0f to Color.Transparent,
+            0.36f to Color.Transparent,
+            0.46f to p.accent.copy(alpha = if (p.dark) 0.07f else 0.05f),
+            0.52f to p.secondary.copy(alpha = if (p.dark) 0.09f else 0.06f),
+            0.62f to Color.Transparent,
+            1f to Color.Transparent,
+            start = Offset(0f, size.height * 0.30f),
+            end = Offset(size.width, size.height * 0.72f),
+        ))
     }
 }

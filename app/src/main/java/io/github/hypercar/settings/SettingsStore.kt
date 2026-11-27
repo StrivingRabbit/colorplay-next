@@ -112,6 +112,17 @@ object SettingsStore {
             SettingsRevision.bump()
         }
 
+    /** 仅未保存偏好时，已安装 Alpha 版本默认接收测试版；显式关闭始终优先。 */
+    var receiveAlphaUpdates: Boolean
+        get() = io.github.hypercar.update.resolveReceiveAlphaUpdates(
+            if (p().contains("receive_alpha_updates")) p().getBoolean("receive_alpha_updates", false) else null,
+            io.github.hypercar.BuildConfig.VERSION_NAME,
+        )
+        set(value) {
+            p().edit().putBoolean("receive_alpha_updates", value).apply()
+            SettingsRevision.bump()
+        }
+
     /** Manual-stop cooldown; one atomic preference retains the deadline across process restarts. */
     var automaticPause: String
         get() = p().getString("automatic_connection_pause", "").orEmpty()

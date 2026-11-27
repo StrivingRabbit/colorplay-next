@@ -29,6 +29,10 @@ pub trait SocketProvider: Send + Sync {
     fn open_tcp(&self, host: &str, port: u16, timeout_ms: u32) -> Option<TcpStream>;
     // Port zero binds an ephemeral local port without connecting to a remote port.
     fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket>;
+    #[cfg(all(test, not(target_os = "android")))]
+    fn aac_encoder_for_test(&self, sample_rate: u32) -> std::io::Result<crate::aac::AacEncoder> {
+        crate::aac::AacEncoder::at_rate(sample_rate)
+    }
     fn bind_timing_network(&self, _socket: &std::net::UdpSocket) -> std::io::Result<()> {
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "timing network binding unavailable"))
     }
@@ -3850,7 +3854,11 @@ pub(crate) async fn negotiate_realtime_audio(
     replacing: bool,
 ) -> Option<AudioOut> {
     let encoder = if codec.stream_type() == 102 {
-        match crate::aac::AacEncoder::at_rate(codec.rate()) {
+        #[cfg(all(test, not(target_os = "android")))]
+        let encoder = factory.aac_encoder_for_test(codec.rate());
+        #[cfg(not(all(test, not(target_os = "android"))))]
+        let encoder = crate::aac::AacEncoder::at_rate(codec.rate());
+        match encoder {
             Ok(encoder) => { emit_log(&format!("AUDIO: AAC-LC encoder ready {}Hz stereo 256kbps raw/SPF1024",codec.rate())); Some(encoder) }
             Err(error) => { emit_log(&format!("AUDIO: AAC encoder unavailable: {error}")); return None; }
         }

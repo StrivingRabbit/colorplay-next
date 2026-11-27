@@ -4,12 +4,44 @@ Android 原生 Compose 应用，基于 [HyperCar](https://github.com/fw867/hyper
 
 ## 本分支状态
 
-- 应用包名 `com.emxxme.colorplaynext`；沿用旧版签名材料与图标，版本 `0.2.8/208`。签名私钥及配置不入库。
+- 应用包名 `com.emxxme.colorplaynext`；沿用旧版签名材料与图标，当前测试版本 `0.2.12/212`（等待用户验收，尚未发布正式 Release）。签名私钥及配置不入库。
 - Android 原生 Compose，不引入跨平台构建；集成 AndroidLiquidGlass 的 Backdrop 1.0.0 背景采样、模糊及镜头折射，底栏为页面上的独立浮层，顶部为背景模糊并沿下缘渐隐的玻璃浮层。页面背景、内容分别录制，避免采样自身。不使用库全强度默认高光或额外整圈描边，以折射为主体，配合明确调低的方向反光、柔和阴影和分级表面染色区分卡片/底栏/背景；底栏为独立 LiquidBottomTabs，带弹簧移动的折射指示器，支持点选与横向拖动。
 - OPPO 源仅在启动阶段持续拒连、Shizuku 可用、当前会话仍有效时有界拉起 `com.oplus.ocar/.CarlifeActivity`；已经连接的源不重开。保留其他系统 CarLife+ 的手动入口。
 - 导航、音乐、触摸、方向盘按键及自动重连沿用上游实现；一加16、原厂无线接收端与盒子的实际闭环仍需逐项真机验证，不宣称全部已兼容。
 - OPPO 组件与时序经验参考本地 ColorPlay 实测；协议研究参考 [CarDeck](https://github.com/shaonialife/cardeck)。未合入 ColorPlay 反编译主体或厂商密钥。
 - 本衍生版本遵循 GPL-3.0，保留上游历史和许可。以下保留上游使用说明，涉及 HyperCar 品牌、平台验证与发布地址的内容属于上游说明，不代表本分支验收。
+
+## 界面预览
+
+以下为 `0.2.12/212` 在 Android 模拟器中的实际截图，未连接车机，仅展示界面与更新渠道设置，不代表实车连接验收。本轮仅提供测试 APK，用户确认后才发布正式 Release。
+
+| 浅色首页 | 深色首页 |
+|---|---|
+| <img src="docs/screenshots/0.2.12-home-light.png" alt="ColorPlay Next 浅色玻璃卡片与底栏" width="320"> | <img src="docs/screenshots/0.2.12-home-dark.png" alt="ColorPlay Next 深色玻璃卡片与底栏" width="320"> |
+
+| 浅色更新设置 | 深色更新设置 |
+|---|---|
+| <img src="docs/screenshots/0.2.12-updates-light.png" alt="浅色接收 Alpha 更新开关" width="320"> | <img src="docs/screenshots/0.2.12-updates-dark.png" alt="深色接收 Alpha 更新开关" width="320"> |
+
+## 公共界面组件
+
+页面主要控件已抽取到 `app/src/main/java/io/github/hypercar/ui/components/`：
+
+| 控件 | 公共组件 | 统一维护范围 |
+|---|---|---|
+| 开关 | `GlassSwitch` | 轨道/滑块对比、折射、禁用态与 Switch 无障碍语义 |
+| 按钮 | `CapsuleButton`、`GlassBackButton` | 主次按钮、文字对比、返回触控区域与圆角点击反馈 |
+| 卡片 | `GlassPanel` / `Modifier.glassPanel` | 分主题染色、背景采样、模糊/折射及轻阴影 |
+| 悬浮底栏 | `LiquidBottomTabs` | 页面采样、透明背景、选中指示器及拖动交互 |
+| 底部面板 | `GlassBottomSheet` | 跨窗口背景采样与玻璃表面 |
+
+底层 `liquidGlassSurface` 负责共有材质绘制；业务页面应优先复用组件，不重复实现。系统确认对话框、文本操作按钮与车联内容布局仍按各自语义处理，并非把所有 Android 控件强制替换为同一种玻璃外观。
+
+## 更新渠道选择
+
+“关于 → 更新”中的 **接收 Alpha 测试版更新** 开关会持久保存。稳定版首次默认关闭；Alpha 安装首次默认开启，用户明确关闭后不会被覆盖。开启时比较可下载的正式版与 Alpha，关闭时只检查正式版；切换会立即重新检查并丢弃旧渠道的未完成结果，不会自动安装。
+
+Alpha 用于提前体验自动合入的 HyperCar 新底座，可能存在连接与功能异常。它与正式版沿用相同包名/证书，安装后会覆盖当前应用，不会形成第二个 App。关闭开关不会降级，回到正式版必须等待更高版本及安装编号。启用测试版时当前读取最近 100 个 GitHub Releases。
 
 ## 底座维护
 

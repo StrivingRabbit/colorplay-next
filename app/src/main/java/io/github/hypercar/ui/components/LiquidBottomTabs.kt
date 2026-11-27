@@ -53,6 +53,8 @@ import com.kyant.backdrop.effects.vibrancy
 import com.kyant.backdrop.highlight.Highlight
 import com.kyant.backdrop.highlight.HighlightStyle
 import com.kyant.backdrop.shadow.Shadow
+import com.kyant.backdrop.shadow.InnerShadow
+import androidx.compose.ui.unit.DpOffset
 import io.github.hypercar.ui.theme.ElectricCyan
 import io.github.hypercar.ui.theme.LocalAppPalette
 import io.github.hypercar.ui.theme.TextSecondary
@@ -93,15 +95,16 @@ fun LiquidBottomTabs(
                 effects = {
                     vibrancy()
                     blur(4.dp.toPx())
-                    lens(26.dp.toPx(), 30.dp.toPx())
+                    lens(28.dp.toPx(), 34.dp.toPx(), depthEffect = true)
                 },
-                highlight = { Highlight(width = 0.7.dp, blurRadius = 1.dp, alpha = 0.45f,
-                    style = HighlightStyle.Default(intensity = 0.30f, angle = 60f, falloff = 2f)) },
+                highlight = { Highlight(width = 1.3.dp, blurRadius = 0.8.dp, alpha = if (dark) 0.70f else 0.60f,
+                    style = HighlightStyle.Default(intensity = 0.42f, angle = 55f, falloff = 2.4f)) },
                 shadow = { Shadow(radius = if (dark) 18.dp else 10.dp,
                     color = Color.Black.copy(alpha = if (dark) 0.30f else 0.09f)) },
-                innerShadow = null,
+                innerShadow = { InnerShadow(radius = 4.dp, offset = DpOffset(0.dp, 1.dp),
+                    color = Color.Black.copy(alpha = if (dark) 0.18f else 0.07f)) },
                 exportedBackdrop = barBackdrop,
-                onDrawSurface = { drawRect(if (dark) Color(0xFF7489A5).copy(alpha = 0.22f) else Color.White.copy(alpha = 0.48f)) },
+                onDrawSurface = { drawRect(if (dark) Color(0xFF7489A5).copy(alpha = 0.12f) else Color.White.copy(alpha = 0.26f)) },
             )
             .padding(4.dp)
             .selectableGroup(),

@@ -144,12 +144,35 @@ mod platform {
 #[cfg(target_os = "android")]
 pub use platform::AacEncoder;
 #[cfg(not(target_os = "android"))]
-pub struct AacEncoder;
+pub struct AacEncoder {
+    #[cfg(test)]
+    fake: Option<(u32, usize)>,
+}
 #[cfg(not(target_os = "android"))]
 impl AacEncoder {
     pub fn at_rate(_: u32) -> io::Result<Self> { Err(io::Error::other("AAC encoder requires Android")) }
-    pub fn sample_rate(&self) -> u32 { 48000 }
-    pub fn encode(&mut self, _: &[i16]) -> io::Result<Vec<Vec<u8>>> { Err(io::Error::other("AAC encoder requires Android")) }
+    #[cfg(test)]
+    pub(crate) fn fake_for_test(sample_rate: u32) -> Self {
+        assert!(matches!(sample_rate, 44_100 | 48_000));
+        Self { fake: Some((sample_rate, 0)) }
+    }
+    pub fn sample_rate(&self) -> u32 {
+        #[cfg(test)]
+        if let Some((rate, _)) = self.fake { return rate; }
+        48000
+    }
+    pub fn encode(&mut self, _pcm: &[i16]) -> io::Result<Vec<Vec<u8>>> {
+        #[cfg(test)]
+        if let Some((_, pending)) = self.fake.as_mut() {
+            if _pcm.len() % 2 != 0 { return Err(io::Error::other("AAC requires complete stereo samples")); }
+            *pending += _pcm.len();
+            let frames = *pending / (FRAMES * 2);
+            *pending %= FRAMES * 2;
+            // 状态机替身只模拟帧节拍，不输出可播放的 AAC。
+            return Ok(vec![vec![0x21, 0x10]; frames]);
+        }
+        Err(io::Error::other("AAC encoder requires Android"))
+    }
 }
 
 /// Accept raw output, or a complete, single AAC-LC 44.1/48 kHz stereo ADTS frame from a vendor codec.
@@ -172,6 +195,24 @@ fn raw_access_unit_at_rate(bytes: &[u8], sample_rate: u32) -> io::Result<&[u8]> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn host_encoder_still_requires_android() {
+        for rate in [44_100, 48_000] {
+            assert!(AacEncoder::at_rate(rate).is_err());
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn explicit_fake_preserves_rate_and_frame_cadence() {
+        for rate in [44_100, 48_000] {
+            let mut encoder = AacEncoder::fake_for_test(rate);
+            assert_eq!(encoder.sample_rate(), rate);
+            assert!(encoder.encode(&[0; FRAMES]).unwrap().is_empty());
+            assert_eq!(encoder.encode(&[0; FRAMES * 3]).unwrap().len(), 2);
+            assert!(encoder.encode(&[0]).is_err());
+        }
+    }
     #[test] fn raw_frames_are_never_byte_swapped() { assert_eq!(raw_access_unit(&[0x21,0x10,0x56]).unwrap(), &[0x21,0x10,0x56]); }
     #[test] fn strips_only_complete_single_lc48_stereo_adts() {
         let frame = [0xff,0xf1,0x4c,0x80,0x01,0x3f,0xfc,0x21,0x10];

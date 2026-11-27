@@ -372,7 +372,7 @@ private fun AppearanceSection() {
             color = TextPrimary, style = MaterialTheme.typography.titleSmall)
         Spacer(Modifier.height(6.dp))
         Text(if (io.github.hypercar.ui.theme.LocalAppPalette.current.dark) "深空背景 · 青色强调 · 玻璃卡片"
-            else "浅灰背景 · 蓝色强调 · 白色圆角卡片", color = TextSecondary,
+            else "浅色透光背景 · 蓝色强调 · 折射玻璃卡片", color = TextSecondary,
             style = MaterialTheme.typography.bodySmall)
     }
 }

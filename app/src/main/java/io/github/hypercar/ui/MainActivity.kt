@@ -304,7 +304,7 @@ private fun MainContent(onStart: () -> Unit) {
 
     // ---- 自动更新：启动时按 6 小时节流检查一次；有新版弹一次（可"稍后"）----
     val updateState by UpdateCenter.state.collectAsStateWithLifecycle()
-    var updateDialogClosed by remember { mutableStateOf(false) }
+    var updateDialogClosed by remember((updateState as? UpdateUiState.Available)?.info?.tag) { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         // SharedPreferences may still be loading from disk at cold start; never wait on main.
         if (withContext(Dispatchers.IO) { UpdateCenter.shouldAutoCheck(context) }) UpdateCenter.check(context)
@@ -356,6 +356,9 @@ private fun MainContent(onStart: () -> Unit) {
         )
     }
 
+    val glassThemeKey = io.github.hypercar.ui.theme.LocalAppPalette.current.dark
+    // Recreate recorded sources on theme changes rather than refracting a stale light/dark frame.
+    androidx.compose.runtime.key(glassThemeKey) {
     val backgroundBackdrop = rememberLayerBackdrop()
     val contentBackdrop = rememberLayerBackdrop()
     // ColorPlay Next chrome: two one-way sampled layers keep the fork's glass separate from session logic.
@@ -449,6 +452,7 @@ private fun MainContent(onStart: () -> Unit) {
         }
     }
     }
+    } // Recreate recorders and consumers together so coordinates are rebound after theme switching.
 }
 
 // The fork-owned header is isolated in components/GlassStatusStrip.kt.
