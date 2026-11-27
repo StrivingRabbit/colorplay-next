@@ -13,18 +13,21 @@ ROOT = Path(__file__).resolve().parents[1]
 EXPECTED = 'e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66'
 
 
-def verifier():
-    workflow = (ROOT / '.github/workflows/alpha-upstream.yml').read_text()
+def verifier(workflow_name='alpha-upstream.yml'):
+    workflow = (ROOT / '.github/workflows' / workflow_name).read_text()
     step = workflow.split('      - name: 强制验证正式证书并准备发布附件', 1)[1]
     source = step.split("          python3 - <<'PY'\n", 1)[1].split('\n          PY', 1)[0]
     return compile('\n'.join(line[10:] for line in source.splitlines()), 'alpha-workflow-verifier', 'exec')
 
 
 class AlphaSigningTest(unittest.TestCase):
-    def check_certificate(self, text, core=True):
+    workflow_name = 'alpha-upstream.yml'
+
+    def check_certificate(self, text, core=True, badging="package: name='com.emxxme.colorplaynext' versionCode='214' versionName='0.2.13'"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'alpha-certs.txt').write_text(text)
+            (root / 'official-badging.txt').write_text(badging)
             apk = root / 'app/build/outputs/apk/release/app-release.apk'
             apk.parent.mkdir(parents=True)
             with zipfile.ZipFile(apk, 'w') as archive:
@@ -33,8 +36,8 @@ class AlphaSigningTest(unittest.TestCase):
             previous = Path.cwd()
             try:
                 os.chdir(root)
-                with patch.dict(os.environ, {'RUNNER_TEMP': str(root)}), contextlib.redirect_stdout(io.StringIO()):
-                    exec(verifier(), {})
+                with patch.dict(os.environ, {'RUNNER_TEMP': str(root), 'VERSION': '0.2.13', 'CODE': '214'}), contextlib.redirect_stdout(io.StringIO()):
+                    exec(verifier(self.workflow_name), {})
             finally:
                 os.chdir(previous)
 
@@ -71,6 +74,18 @@ class AlphaSigningTest(unittest.TestCase):
     def test_missing_native_core_is_rejected(self):
         with self.assertRaisesRegex(SystemExit, '缺少 Rust'):
             self.check_certificate('V2 Signer: certificate SHA-256 digest: ' + EXPECTED, core=False)
+
+
+class OfficialSigningTest(AlphaSigningTest):
+    workflow_name = 'official-upstream-release.yml'
+
+    def test_wrong_package_version_or_code_is_rejected(self):
+        for text in ("package: name='io.github.hypercar' versionCode='214' versionName='0.2.13'",
+                     "package: name='com.emxxme.colorplaynext' versionCode='213' versionName='0.2.13'",
+                     "package: name='com.emxxme.colorplaynext' versionCode='214' versionName='0.2.12'",
+                     'unrecognized badging'):
+            with self.subTest(badging=text), self.assertRaisesRegex(SystemExit, '身份不匹配'):
+                self.check_certificate('V2 Signer: certificate SHA-256 digest: ' + EXPECTED, badging=text)
 
 
 if __name__ == '__main__':

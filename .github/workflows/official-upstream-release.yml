@@ -1,0 +1,299 @@
+name: 跟随上游官方正式 Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/official-upstream-release.yml
+      - tools/prepare-official-release.py
+      - tools/test_prepare_official_release.py
+      - tools/test_alpha_signing.py
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: '可选：明确回补的上游正式 Release tag；空值仅处理基线之后的新 Release'
+        type: string
+        default: ''
+      allow_backfill:
+        description: '仅在显式指定 tag 时允许回补历史正式 Release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+concurrency:
+  group: publish-colorplay-next
+  cancel-in-progress: false
+
+jobs:
+  official:
+    if: github.repository == 'StrivingRabbit/colorplay-next' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出可信 main（不混入 Alpha）
+        uses: actions/checkout@v4
+        with:
+          repository: StrivingRabbit/colorplay-next
+          ref: main
+          fetch-depth: 0
+
+      - name: 准备正式候选或初始化游标
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OFFICIAL_REPO_DIR: ${{ github.workspace }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          ALLOW_BACKFILL: ${{ inputs.allow_backfill }}
+        run: |
+          set -euo pipefail
+          git fetch origin main alpha --tags
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+          git remote add upstream https://github.com/fw867/hypercar.git
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git show origin/main:tools/prepare-official-release.py > "$RUNNER_TEMP/prepare-official-release.py"
+          ARGS=()
+          if [ -n "$REQUESTED_TAG" ]; then ARGS+=(--tag "$REQUESTED_TAG"); fi
+          if [ "$ALLOW_BACKFILL" = true ]; then ARGS+=(--allow-backfill); fi
+          python3 "$RUNNER_TEMP/prepare-official-release.py" "${ARGS[@]}" 2>&1 | tee "$RUNNER_TEMP/official-prepare.log"
+
+      - name: 无新正式 Release 时记录摘要
+        if: steps.prepare.outputs.changed == 'false'
+        run: echo '首次仅保存当前已有正式 Release 基线；后续无新增时不构建、不更新 main、不发布。历史回补必须手动指定 tag 并勾选允许回补。' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 安装 JDK 17
+        if: steps.prepare.outputs.changed == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Rust 与 Android 目标
+        if: steps.prepare.outputs.changed == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: 安装 NDK r27c
+        if: steps.prepare.outputs.changed == 'true'
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+          link-to-sdk: true
+
+      - name: 安装 cargo-ndk
+        if: steps.prepare.outputs.changed == 'true'
+        run: cargo install cargo-ndk --locked
+
+      - name: Rust 全量测试
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          CMAKE_GENERATOR: Ninja
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: |
+          set -euo pipefail
+          RUST_BACKTRACE=1 cargo test --manifest-path rust-core/Cargo.toml 2>&1 | tee "$RUNNER_TEMP/official-rust-test.log"
+
+      - name: 编译 Rust 核心层
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+          CMAKE_GENERATOR: Ninja
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        working-directory: rust-core
+        run: |
+          set -euo pipefail
+          cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
+          test -f ../app/src/main/jniLibs/arm64-v8a/libhypercar_core.so
+
+      - name: 配置 Gradle
+        if: steps.prepare.outputs.changed == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 写入正式签名配置
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, os, subprocess
+          from pathlib import Path
+          required = ('KEYSTORE_BASE64', 'KEYSTORE_PASSWORD', 'KEY_ALIAS', 'KEY_PASSWORD')
+          missing = [key for key in required if not os.environ.get(key)]
+          if missing:
+              raise SystemExit('缺少正式签名 Secrets：' + ', '.join(missing))
+          Path('release.jks').write_bytes(base64.b64decode(''.join(os.environ['KEYSTORE_BASE64'].split()), validate=True))
+          def escape(value):
+              return ''.join('\\u%04x' % ord(char) for char in value)
+          Path('keystore.properties').write_text(
+              'storeFile=release.jks\n'
+              + 'storePassword=' + escape(os.environ['KEYSTORE_PASSWORD']) + '\n'
+              + 'keyAlias=' + escape(os.environ['KEY_ALIAS']) + '\n'
+              + 'keyPassword=' + escape(os.environ['KEY_PASSWORD']) + '\n')
+          certificate = subprocess.check_output(['keytool', '-exportcert', '-keystore', 'release.jks',
+              '-storepass:env', 'KEYSTORE_PASSWORD', '-alias', os.environ['KEY_ALIAS']])
+          expected = 'e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66'
+          if hashlib.sha256(certificate).hexdigest() != expected:
+              raise SystemExit('Secrets 不对应既有正式证书，禁止构建')
+          PY
+
+      - name: 构建 APK、Android 单测与 Release Lint
+        if: steps.prepare.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          bash ./gradlew :app:assembleRelease :app:testDebugUnitTest :app:lintRelease \
+            -Phypercar.officialBuild=true --stacktrace 2>&1 | tee "$RUNNER_TEMP/official-gradle.log"
+
+      - name: 强制验证正式证书并准备发布附件
+        if: steps.prepare.outputs.changed == 'true'
+        id: package
+        env:
+          VERSION: ${{ steps.prepare.outputs.version }}
+          CODE: ${{ steps.prepare.outputs.code }}
+          UPSTREAM: ${{ steps.prepare.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          python3 tools/test_alpha_signing.py
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$CODE" =~ ^[0-9]+$ ]]
+          [[ "$UPSTREAM" =~ ^[0-9a-f]{40}$ ]]
+          APK=app/build/outputs/apk/release/app-release.apk
+          test -f "$APK"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          APKSIGNER=$(find "$SDK/build-tools" -name apksigner -type f | sort -V | tail -n1)
+          test -n "$APKSIGNER"
+          "$APKSIGNER" verify --print-certs "$APK" > "$RUNNER_TEMP/alpha-certs.txt"
+          AAPT2="$(dirname "$APKSIGNER")/aapt2"
+          test -x "$AAPT2"
+          "$AAPT2" dump badging "$APK" > "$RUNNER_TEMP/official-badging.txt"
+          python3 - <<'PY'
+          import os, re, zipfile
+          from pathlib import Path
+          badging = Path(os.environ['RUNNER_TEMP'], 'official-badging.txt').read_text()
+          package = re.search(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", badging, re.M)
+          identity = ('com.emxxme.colorplaynext', os.environ['CODE'], os.environ['VERSION'])
+          if not package or package.groups() != identity:
+              raise SystemExit('APK 包名或版本身份不匹配，禁止发布：' + repr(package.groups() if package else None))
+          certs = Path(os.environ['RUNNER_TEMP'], 'alpha-certs.txt').read_text()
+          expected = 'e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66'
+          actual = [m.group(1).lower() for line in certs.splitlines()
+                    if (m := re.fullmatch(r'(?:Signer #\d+ certificate|V2 Signer: certificate) SHA-256 digest:\s*([0-9a-fA-F]{64})', line.strip()))]
+          print('APK signer fingerprints:', actual)
+          if not actual:
+              raise SystemExit('无法解析 apksigner 的证书指纹，禁止推送与发布')
+          if 'CN=Android Debug' in certs or len(actual) != 1 or actual[0] != expected:
+              raise SystemExit('APK 正式签名证书不匹配，禁止推送与发布')
+          with zipfile.ZipFile('app/build/outputs/apk/release/app-release.apk') as apk:
+              if 'lib/arm64-v8a/libhypercar_core.so' not in apk.namelist():
+                  raise SystemExit('APK 缺少 Rust 核心层')
+          PY
+          NAME="colorplay-next-${VERSION}-release.apk"
+          cp "$APK" "$NAME"
+          sha256sum "$NAME" > "$NAME.sha256"
+          {
+            echo "### ColorPlay Next ${VERSION}（正式版）"
+            echo "- versionCode：${CODE}"
+            echo "- 上游官方 Release 精确提交：fw867/hypercar @ ${UPSTREAM}"
+            echo "- 本仓库候选提交：$(git rev-parse HEAD)"
+            echo "- APK SHA-256：$(cut -d' ' -f1 "$NAME.sha256")"
+            echo '- 正式签名证书 SHA-256：e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66'
+            echo '- 检查：Rust 全量测试、Android 单元测试、Release Lint、源码 Release 构建、签名校验均通过；未下载上游 APK。'
+          } > "$RUNNER_TEMP/official-notes.md"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: 所有验证通过后 CAS 更新 main 与正式 tag 并发布
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          BASE: ${{ steps.prepare.outputs.base }}
+          NAME: ${{ steps.package.outputs.name }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          ALLOW_BACKFILL: ${{ inputs.allow_backfill }}
+          OFFICIAL_REPO_DIR: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          CANDIDATE=$(git rev-parse HEAD)
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$BASE"
+          git merge-base --is-ancestor "$BASE" "$CANDIDATE"
+          EXISTING=$(git ls-remote origin "refs/tags/$TAG" | cut -f1)
+          if [ -n "$EXISTING" ]; then
+            test "$EXISTING" = "$CANDIDATE"
+          else
+            git tag "$TAG" "$CANDIDATE"
+          fi
+          # CAS 同时保护人工更新；main 仅允许从准备时基线快进，绝不改写已有 tag。
+          git push --atomic "--force-with-lease=refs/heads/main:$BASE" origin \
+            HEAD:refs/heads/main "refs/tags/$TAG:refs/tags/$TAG"
+          gh release create "$TAG" "$NAME" "$NAME.sha256" \
+            --repo StrivingRabbit/colorplay-next --verify-tag \
+            --title "ColorPlay Next ${VERSION}" --notes-file "$RUNNER_TEMP/official-notes.md" --draft --latest=false
+          # 全部附件上传完成后才公开，避免部分上传失败产生不完整的正式包。
+          gh api "repos/StrivingRabbit/colorplay-next/releases/tags/$TAG" > "$RUNNER_TEMP/official-draft.json"
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          release = json.loads(Path(os.environ['RUNNER_TEMP'], 'official-draft.json').read_text())
+          if not release['draft'] or release['prerelease']:
+              raise SystemExit('准备公开的 Release 不是预期正式草稿')
+          for name in (os.environ['NAME'], os.environ['NAME'] + '.sha256'):
+              assets = [a for a in release['assets'] if a['name'] == name]
+              if len(assets) != 1 or assets[0]['state'] != 'uploaded' or assets[0]['size'] != Path(name).stat().st_size:
+                  raise SystemExit('草稿附件缺失、不完整或大小不符，禁止公开')
+              digest = assets[0].get('digest')
+              if digest and digest != 'sha256:' + hashlib.sha256(Path(name).read_bytes()).hexdigest():
+                  raise SystemExit('草稿附件摘要与本地验证产物不同，禁止公开')
+          PY
+          gh release edit "$TAG" --repo StrivingRabbit/colorplay-next --draft=false --latest
+          ARGS=(--finalize)
+          if [ -n "$REQUESTED_TAG" ]; then ARGS+=(--tag "$REQUESTED_TAG"); fi
+          if [ "$ALLOW_BACKFILL" = true ]; then ARGS+=(--allow-backfill); fi
+          python3 "$RUNNER_TEMP/prepare-official-release.py" "${ARGS[@]}"
+          cat "$RUNNER_TEMP/official-notes.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 失败摘要
+        if: failure()
+        run: |
+          {
+            echo '### 官方 Release 跟随失败'
+            echo '源码冲突、测试、Lint、构建、签名或 CAS 失败均禁止推送候选和发布。'
+            echo 'Git 推送与 GitHub Release API 不能跨服务原子提交。若推送后 Release API 失败，main/tag 可能已更新；游标不推进，下次仅允许复用同一候选重试，禁止重打 tag。若 main 再前进必须人工恢复。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 保存失败报告
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-failure-reports-${{ github.run_id }}
+          path: |
+            app/build/reports/tests/**
+            app/build/test-results/**
+            app/build/reports/lint-results-release*
+            ${{ runner.temp }}/alpha-certs.txt
+            ${{ runner.temp }}/official-*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: 清理签名材料
+        if: always()
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          for name in ('release.jks', 'keystore.properties'):
+              Path(name).unlink(missing_ok=True)
+          PY

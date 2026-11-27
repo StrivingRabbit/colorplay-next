@@ -4,7 +4,7 @@ Android 原生 Compose 应用，基于 [HyperCar](https://github.com/fw867/hyper
 
 ## 本分支状态
 
-- 应用包名 `com.emxxme.colorplaynext`；沿用旧版签名材料与图标，当前测试版本 `0.2.12/212`（等待用户验收，尚未发布正式 Release）。签名私钥及配置不入库。
+- 应用包名 `com.emxxme.colorplaynext`；沿用旧版签名材料与图标，正式版本 `0.2.12/212`（已发布 Release）。签名私钥及配置不入库。
 - Android 原生 Compose，不引入跨平台构建；集成 AndroidLiquidGlass 的 Backdrop 1.0.0 背景采样、模糊及镜头折射，底栏为页面上的独立浮层，顶部为背景模糊并沿下缘渐隐的玻璃浮层。页面背景、内容分别录制，避免采样自身。不使用库全强度默认高光或额外整圈描边，以折射为主体，配合明确调低的方向反光、柔和阴影和分级表面染色区分卡片/底栏/背景；底栏为独立 LiquidBottomTabs，带弹簧移动的折射指示器，支持点选与横向拖动。
 - OPPO 源仅在启动阶段持续拒连、Shizuku 可用、当前会话仍有效时有界拉起 `com.oplus.ocar/.CarlifeActivity`；已经连接的源不重开。保留其他系统 CarLife+ 的手动入口。
 - 导航、音乐、触摸、方向盘按键及自动重连沿用上游实现；一加16、原厂无线接收端与盒子的实际闭环仍需逐项真机验证，不宣称全部已兼容。
@@ -13,7 +13,7 @@ Android 原生 Compose 应用，基于 [HyperCar](https://github.com/fw867/hyper
 
 ## 界面预览
 
-以下为 `0.2.12/212` 在 Android 模拟器中的实际截图，未连接车机，仅展示界面与更新渠道设置，不代表实车连接验收。本轮仅提供测试 APK，用户确认后才发布正式 Release。
+以下为 `0.2.12/212` 在 Android 模拟器中的实际截图，未连接车机，仅展示界面与更新渠道设置，不代表实车连接验收；该版本已发布正式 Release。
 
 | 浅色首页 | 深色首页 |
 |---|---|
@@ -51,13 +51,22 @@ Alpha 用于提前体验自动合入的 HyperCar 新底座，可能存在连接�
 - 升级顺序：干净工作区 → `git fetch upstream main` → 对比 `UpstreamBase.COMMIT..upstream/main` → 在独立升级分支合并 → 审查 OPPO / UI 接入冲突 → JVM、原生、Release Lint 和真机回归 → 更新底座记录并用原证书发布。fetch 失败时不更新底座记录。
 - 尽可能将定制封装在独立文件；必须修改的会话接入点保持小范围，不能保证完全无冲突。应用内“检查更新”只检查 ColorPlay Next APK，不直接替换底座、不安装 HyperCar APK。
 
+## 上游正式 Release 自动跟随
+
+- 用户授权的正式发布通道使用工作流“跟随上游官方正式 Release”，每小时检查一次 `fw867/hypercar` 的正式 Release（GitHub 定时任务可能延迟）；草稿和预发布不触发正式版。现有每日北京时间 06:00 的 Alpha 通道继续独立运行。
+- 首次运行只登记已存在的上游正式 Release，不补发历史版本；后续新增的正式 Release 按发布时间顺序处理。同一 Release 的发布记录持久保存，避免重复出包。历史回补必须手动填写 `upstream_tag` 并明确勾选 `allow_backfill`。
+- 从 `main` 的本项目源码出发，获取上游 Release 的精确 tag 提交，不合入 Alpha 分支，也不直接下载或转发上游 APK。仅项目身份/自动化文件按明确保护清单保留本仓库版本，业务源码冲突必须人工处理。
+- 候选必须通过 Rust 全量测试与原生编译、Android 单元测试、Release Lint、Release 构建和原证书指纹强校验。全部通过后才更新 `main` 并发布正式 Release；版本号和安装编号考虑已发布正式版、Alpha 及当前分支，不允许安装编号倒退或覆盖既有标签。
+- 正式/Alpha 发布共享同一并发锁。Git 推送与 Release API 不属于跨服务原子事务：若在推送后发布失败，不推进成功游标，后续优先恢复相同候选；若 `main` 已继续前进、出现不完整草稿/缺失附件、其他渠道占用更高编号，或标签/证书变化，则停止并要求人工处理，不擅自改写历史。正式包先上传至草稿，上传完成才公开为正式版；不会把空 Release 当作发布成功。
+- 自动化门禁通过不等于完成实车验收。用户可在 GitHub Actions 查看具体上游版本、提交、测试和发布结果；源码冲突或任一步验证失败均不会被跳过。
+
 ## Alpha 自动升级实验线
 
 - `main` 保持正式开发线；`alpha` 是用户授权的自动合并实验线，沿用包名与原证书，安装后会覆盖正式 App，并非独立双开应用。
 - 工作流“同步上游并发布 Alpha”必须留在默认分支 `main`。每天北京时间 06:00（GitHub schedule 可能延迟）检测 `fw867/hypercar/main`，也可在 Actions 选择 **main** 手动 Run workflow。首次从新建 alpha 起点引导一个候选版，其后无上游变化不重复出包。
 - 顺序：准备临时合并 → Rust 全量测试与交叉编译 → Android 单测/Lint/Release 构建 → 原签名指纹强校验 → 普通推送 alpha → 发布 `vX.Y.Z-alpha.N` 预发布，绝不设置为 latest。合并冲突不自动选边，验证失败不推进 alpha。
 - 签名使用仓库 Secrets `KEYSTORE_BASE64`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`，缺失直接失败。已知的历史 Rust 测试失败仍会阻止 Alpha，不以跳过测试冒充验证通过。
-- Alpha APK 的检查更新仅跟踪本仓库合法 Alpha 预发布；正式 APK 仍读取最新正式 Release。Alpha 构建通过不代表已完成真机/实车验收，正式合并发布需人工确认。
+- 应用内“接收 Alpha 测试版更新”开关关闭时只检查最新正式版，开启时比较本仓库合法 Alpha 与正式版。Alpha 构建通过不代表已完成真机/实车验收；正式版仅由人工授权发布，或由上述已授权的上游正式 Release 跟随通道完成全套门禁后发布。
 - 安装编号按 `max(alpha, main) + 1` 递增；升级回正式版必须发布更大的 versionCode，并使用不低于 Alpha 目标核心版本的正式版本号，不能直接覆盖回旧正式 APK。`main` 定制变更需要人工同步至 alpha；本流程仅自动同步上游。
 - `.github`、`tools`、版本文件、底座元数据与项目约定由本分支维护，上游不能静默替换发布脚本。Release 上传若在分支推送后失败，重跑会尝试重发同一候选版，不移动已有发布标签。
 
