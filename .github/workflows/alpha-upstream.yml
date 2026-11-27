@@ -7,6 +7,8 @@ on:
     paths:
       - .github/workflows/alpha-upstream.yml
       - tools/prepare-alpha.py
+      - tools/test_alpha_signing.py
+      - app/src/test/java/io/github/hypercar/session/AirplayEndpointConnectorTest.kt
   schedule:
     - cron: '0 22 * * *' # 北京时间每天 06:00
   workflow_dispatch:

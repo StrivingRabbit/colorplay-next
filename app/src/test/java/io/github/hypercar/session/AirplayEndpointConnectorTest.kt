@@ -115,20 +115,42 @@ class AirplayEndpointConnectorTest {
     }
 
     @Test fun refusalInvalidatesAndReconnectsToRealNewListener() = runTest {
-        val deadPort = ServerSocket(0).use { it.localPort }
-        ServerSocket(0).use { server ->
-            val expired = AirplayTarget("127.0.0.1", deadPort)
-            val live = AirplayTarget("127.0.0.1", server.localPort)
-            val invalidated = mutableListOf<AirplayTarget>()
-            var resolves = 0
-            val c = AirplayEndpointConnector(current = { true }, now = { testScheduler.currentTime },
-                open = { target: AirplayTarget -> runCatching { Socket(target.host, target.port) }.getOrNull() },
-                close = { s: Socket -> s.close() }, invalidate = { invalidated += it }, updates = { emptyList() },
-                discover = { resolves++; listOf(live) }, pause = { testScheduler.advanceTimeBy(400) })
-            val connected = c.connect(listOf(expired), 8000)!!
-            assertEquals(live, connected.target); assertEquals(listOf(expired), invalidated)
-            assertEquals(1, resolves)
-            server.accept().close(); connected.socket.close()
+        // Reserve a TCP endpoint without listening. Closing a temporary ServerSocket
+        // lets the next listener reuse its ephemeral port and defeats the refusal case.
+        repeat(20) {
+            Socket().use { unavailable ->
+                unavailable.bind(java.net.InetSocketAddress("127.0.0.1", 0))
+                val deadPort = unavailable.localPort
+                ServerSocket(0).use { server ->
+                    assertTrue("refused and live endpoints must differ", deadPort != server.localPort)
+                    val expired = AirplayTarget("127.0.0.1", deadPort)
+                    val live = AirplayTarget("127.0.0.1", server.localPort)
+                    val invalidated = mutableListOf<AirplayTarget>()
+                    val opened = mutableListOf<AirplayTarget>()
+                    var resolves = 0
+                    val c = AirplayEndpointConnector(current = { true }, now = { testScheduler.currentTime },
+                        open = { target: AirplayTarget ->
+                            opened += target
+                            val socket = Socket()
+                            runCatching {
+                                socket.connect(java.net.InetSocketAddress(target.host, target.port), 250)
+                                socket
+                            }.getOrElse { socket.close(); null }
+                        },
+                        close = { s: Socket -> s.close() }, invalidate = { invalidated += it }, updates = { emptyList() },
+                        discover = { resolves++; listOf(live) }, pause = { testScheduler.advanceTimeBy(400) })
+                    val connected = c.connect(listOf(expired), 8000)!!
+                    try {
+                        assertEquals(live, connected.target)
+                        assertEquals(listOf(expired), invalidated)
+                        assertEquals(listOf(expired, live), opened)
+                        assertEquals(1, resolves)
+                        server.accept().close()
+                    } finally {
+                        connected.socket.close()
+                    }
+                }
+            }
         }
     }
 
