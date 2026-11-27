@@ -146,6 +146,7 @@ object RustCoreBridge {
     external fun nativeRequestHostUi(): Boolean
     /** Bounded claim for a new playback action; the core preserves receiver constraints. */
     external fun nativeRequestAudioOwnership(): Boolean
+    external fun nativeNotifyMediaPlayback(playing: Boolean): Boolean
 
     /** 投喂一帧 H.264（Annex B，本机 MediaCodec 编码输出）。[ptsUs] 为微秒时间戳。 */
     external fun nativePushVideoFrame(data: ByteArray, ptsUs: Long)
@@ -163,7 +164,7 @@ object RustCoreBridge {
     external fun nativeStartNavigationAudio(rate: Int, channels: Int)
     external fun nativeCallAudioArmed(token: Long): Boolean
     external fun nativeOfferCallAudio(token: Long, attempt: Long, rate: Int, socketFd: Int): Boolean
-    external fun nativeTakeCallAudioRetry(token: Long, attempt: Long): Int
+    external fun nativeTakeCallAudioResult(token: Long, attempt: Long): Int
     external fun nativePushNavigationAudioPcm(pcm: ShortArray, rate: Int, channels: Int)
     external fun nativeStopNavigationAudio()
 

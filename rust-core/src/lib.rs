@@ -22,6 +22,7 @@ mod speech_resource;
 mod aux_audio;
 mod aux_setup;
 mod mic_probe;
+mod call_aac_eld;
 mod call_audio;
 mod audio_resource;
 mod bplist;
@@ -98,10 +99,10 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeOfferCa
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeTakeCallAudioRetry(
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeTakeCallAudioResult(
     _env: JNIEnv, _class: JClass, token: jlong, attempt: jlong,
 ) -> jint {
-    call_audio::take_retry_reason(token, attempt) as jint
+    call_audio::take_result(token, attempt) as jint
 }
 
 static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
@@ -1028,6 +1029,16 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequest
     }) {
         JNI_TRUE
     } else { JNI_FALSE }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeNotifyMediaPlayback(
+    _env: JNIEnv, _class: JClass, playing: jboolean,
+) -> jboolean {
+    ENGINE.lock().as_ref().is_some_and(|h| !h.shutdown.requested()
+        && h.source_tx.send(engine::SourceEvent::PhoneMediaPlayback {
+            playing: playing == JNI_TRUE, at: std::time::Instant::now(),
+        }).is_ok()) as jboolean
 }
 
 /// Queue a choice from the receiver's last active view-area declaration.

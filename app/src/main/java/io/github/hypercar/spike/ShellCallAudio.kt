@@ -14,33 +14,90 @@ import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
+import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import android.system.StructPollfd
 import android.util.Log
 import java.io.DataInputStream
 import java.io.EOFException
+import java.io.FileDescriptor
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+
+internal enum class CallAudioOfferEnd {
+    WITHDRAWN, IDENTITY_UNCONFIRMED, OTHER;
+
+    companion object {
+        fun fromStatus(status: String?): CallAudioOfferEnd {
+            val endpoint = status?.substringAfter(" endpoint=", "") ?: return OTHER
+            return when {
+                endpoint == ShellCallAudio.OPEN_IDENTITY_UNCONFIRMED -> IDENTITY_UNCONFIRMED
+                endpoint == ShellCallAudio.CONTROLLER_REVOKED ||
+                    endpoint == ShellCallAudio.CALL_NO_LONGER_ELIGIBLE ||
+                    endpoint.startsWith(ShellCallAudio.IDENTITY_REVOKED) ||
+                    endpoint.startsWith(ShellCallAudio.IDENTITY_LOST) -> WITHDRAWN
+                else -> OTHER
+            }
+        }
+    }
+}
+
+internal class ShellCallEndpoint(private val identity: ShellCallIdentity, private val lease: String) {
+    private val live = AtomicBoolean(true)
+    private val stateLock = Any()
+    private val audioLock = Any()
+
+    fun isLive(): Boolean = live.get()
+
+    fun <T : Any> runWhileAuthorized(startBefore: Long? = null, action: () -> T): T? = synchronized(stateLock) {
+        if (live.get()) identity.withCurrentLease(lease, startBefore, action) else null
+    }
+
+    fun <T : Any> runAudioWhileAuthorized(startBefore: Long? = null, action: () -> T): T? = synchronized(audioLock) {
+        if (runWhileAuthorized(startBefore) { true } == true && live.get()) action() else null
+    }
+
+    fun retire(stopTransport: () -> Unit = {}): Boolean {
+        // Cancel new admissions and wake the socket without waiting for Android audio.
+        val wasLive = synchronized(stateLock) {
+            live.getAndSet(false).also { if (it) stopTransport() }
+        }
+        // An admitted native call must leave the media lock before revocation completes.
+        synchronized(audioLock) { return wasLive }
+    }
+}
 
 /** Live PSTN downlink/extraction and uplink/injection owned by the authorized shell service. */
 internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
     private class UnconfirmedCallIdentity : IllegalStateException()
 
     private class Session(
-        val token: Long, val callId: String, val owner: IBinder, val death: IBinder.DeathRecipient,
+        val token: Long, val offer: Long, val callId: String, val owner: IBinder, val death: IBinder.DeathRecipient,
         val socket: ParcelFileDescriptor, val record: AudioRecord, val track: AudioTrack,
+        val endpoint: ShellCallEndpoint,
     ) {
-        val live = AtomicBoolean(true)
         val endReason = AtomicReference<String?>()
     }
 
+    private data class ClosedOffer(val token: Long, val offer: Long, val status: String)
+
     @Volatile private var session: Session? = null
     @Volatile private var status = "idle"
+    private val closedOffers = ArrayDeque<ClosedOffer>()
 
-    fun diagnosticStatus(): String = status
+    fun diagnosticStatus(): String = session?.endReason?.get() ?: status
+
+    fun diagnosticStatus(token: Long, offer: Long): String? {
+        val active = session
+        if (active?.token == token && active.offer == offer) {
+            active.endReason.get()?.let { return "identity=${callIdentity.diagnosticStatus()} endpoint=$it" }
+        }
+        return synchronized(closedOffers) {
+            closedOffers.lastOrNull { it.token == token && it.offer == offer }?.status
+        }
+    }
 
     private val pstnRedirectionMode by lazy { AudioManager::class.java.getField("CALL_REDIRECT_PSTN").getInt(null) }
 
@@ -77,8 +134,9 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
     }
 
     @Synchronized
-    fun open(context: Context, owner: IBinder, token: Long, callId: String, rate: Int): ParcelFileDescriptor? {
-        if (token <= 0 || rate !in setOf(16000, 24000, 44100, 48000) || session != null) return null
+    fun open(context: Context, owner: IBinder, token: Long, offer: Long, callId: String, rate: Int,
+             route: ICallAudioRoute): ParcelFileDescriptor? {
+        if (token <= 0 || offer <= 0 || rate !in setOf(16000, 24000, 44100, 48000) || session != null) return null
         var record: AudioRecord? = null
         var track: AudioTrack? = null
         var sockets: Array<ParcelFileDescriptor>? = null
@@ -130,15 +188,16 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
             owner.linkToDeath(ownerDeath, 0)
             check(owner.isBinderAlive && safeCall())
             if (!callIdentity.confirmsOpen(callId)) throw UnconfirmedCallIdentity()
-            val active = Session(token, callId, owner, ownerDeath, pair[0], downlink, uplink)
-            session = active
+            val endpoint = ShellCallEndpoint(callIdentity, callId)
+            val active = Session(token, offer, callId, owner, ownerDeath, pair[0], downlink, uplink, endpoint)
+            endpoint.runWhileAuthorized { session = active } ?: throw UnconfirmedCallIdentity()
             status = "endpoints_ready_rate_$rate"
             val watchdog = Thread({
-                var reason = "call_no_longer_eligible"
+                var reason = CALL_NO_LONGER_ELIGIBLE
                 try {
-                    while (active.live.get() && safeCall()) {
-                        if (callIdentity.current() != callId) {
-                            reason = "identity_lost_${callIdentity.diagnosticStatus()}"
+                    while (active.endpoint.isLive() && safeCall()) {
+                        if (callIdentity.current(allowFallback = true) != callId) {
+                            reason = "$IDENTITY_LOST${callIdentity.diagnosticStatus()}"
                             break
                         }
                         SystemClock.sleep(callIdentity.millisUntilRefresh())
@@ -148,7 +207,15 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
             }, "hypercar-call-state")
             val transport = Thread({
                 var reason = "uplink_closed"
-                try { transfer(active, rate, manager) { safeCall() && callIdentity.matchesCached(callId) } }
+                try {
+                    transfer(active, rate, manager, route) {
+                        val eligible = safeCall()
+                        val authorized = callIdentity.matchesCached(callId)
+                        if (!authorized) active.endReason.compareAndSet(null, "$IDENTITY_LOST${callIdentity.diagnosticStatus()}")
+                        else if (!eligible) active.endReason.compareAndSet(null, CALL_NO_LONGER_ELIGIBLE)
+                        authorized && eligible
+                    }
+                }
                 catch (error: Exception) { reason = failureStatus("transfer", error) }
                 finally { close(active, reason) }
             }, "hypercar-call-uplink")
@@ -168,36 +235,39 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
         }
     }
 
-    private fun transfer(active: Session, rate: Int, manager: AudioManager, safeCall: () -> Boolean) {
+    private fun transfer(active: Session, rate: Int, manager: AudioManager, route: ICallAudioRoute, safeCall: () -> Boolean) {
         val fd = active.socket.fileDescriptor
         val input = DataInputStream(FileInputStream(fd))
-        val hangup = OsConstants.POLLHUP or OsConstants.POLLERR or OsConstants.POLLNVAL
         val socketState = arrayOf(StructPollfd().apply { this.fd = fd; events = 0 })
-        fun ownsEndpoint(): Boolean = active.live.get() && safeCall() &&
-            (Os.poll(socketState, 0) == 0 || (socketState[0].revents.toInt() and hangup) == 0)
+        fun ownsEndpoint(): Boolean = active.endpoint.isLive() && safeCall() &&
+            (Os.poll(socketState, 0) == 0 || (socketState[0].revents.toInt() and SOCKET_HANGUP) == 0)
         // Rust sends this byte only after the active session accepts the call stream.
         check(input.read() == 1)
-        if (!callIdentity.confirmsOpen(active.callId)) {
-            active.endReason.compareAndSet(null, OPEN_IDENTITY_UNCONFIRMED)
-            return
-        }
-        synchronized(this) {
-            check(session === active && safeCall())
-            if (!callIdentity.isConfirmed(active.callId)) {
-                active.endReason.compareAndSet(null, OPEN_IDENTITY_UNCONFIRMED)
-                return
+        fun startAudio(action: () -> Unit): Boolean = callIdentity.confirmsStart(active.callId, authorize = { deadline ->
+            active.endpoint.runAudioWhileAuthorized(startBefore = deadline, action = action) != null
+        }) preflight@{
+            if (!ownsEndpoint()) return@preflight false
+            // Check the app's Bluetooth route after any Telecom retry.
+            runCatching { route.mayStart() }.getOrDefault(false).also { allowed ->
+                if (!allowed) active.endReason.compareAndSet(null, "phone_route_revoked")
             }
-            active.record.startRecording()
+        }
+        if (!startAudio { active.record.startRecording() }) return recordDeniedLease(active, OPEN_IDENTITY_UNCONFIRMED)
+        // Opening the recorder can consume the proof's lifetime. Confirm again before playing into the call.
+        if (!startAudio {
             active.track.play()
             check(active.record.recordingState == AudioRecord.RECORDSTATE_RECORDING)
             check(active.track.playState == AudioTrack.PLAYSTATE_PLAYING)
-        }
+        }) return recordDeniedLease(active, OPEN_IDENTITY_UNCONFIRMED)
         // Some devices report the actual route only once playback has started. Prime it with silence.
         val silence = ByteArray(rate / 50 * 2)
-        active.track.write(silence, 0, silence.size, AudioTrack.WRITE_NON_BLOCKING)
+        if (!ownsEndpoint()) return
+        active.endpoint.runAudioWhileAuthorized {
+            active.track.write(silence, 0, silence.size, AudioTrack.WRITE_NON_BLOCKING)
+        } ?: return recordDeniedLease(active)
         val routeDeadline = SystemClock.elapsedRealtime() + 300
         while (active.track.routedDevice?.type != AudioDeviceInfo.TYPE_TELEPHONY &&
-            SystemClock.elapsedRealtime() < routeDeadline && active.live.get()
+            SystemClock.elapsedRealtime() < routeDeadline && active.endpoint.isLive()
         ) {
             SystemClock.sleep(10)
         }
@@ -211,23 +281,22 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
         Thread({
             var reason = "downlink_call_no_longer_eligible"
             try {
-                val output = FileOutputStream(fd)
+                val writable = arrayOf(StructPollfd().apply { this.fd = fd; events = OsConstants.POLLOUT.toShort() })
+                val readyByte = byteArrayOf(1)
                 val frames = if (rate >= 44100) 352 else rate / 50
                 val buffer = ByteArray(frames * 2)
                 var ready = false
-                while (active.live.get()) {
+                while (active.endpoint.isLive()) {
                     val count = active.record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
                     if (count <= 0 || count % 2 != 0) {
                         reason = "downlink_read_$count"
                         break
                     }
-                    if (!active.live.get() || !safeCall()) break
                     if (!ready) {
-                        output.write(1)
+                        if (!sendDownlink(active, fd, writable, readyByte, 1, safeCall)) break
                         ready = true
-                        if (!active.live.get() || !safeCall()) break
                     }
-                    output.write(buffer, 0, count)
+                    if (!sendDownlink(active, fd, writable, buffer, count, safeCall)) break
                 }
             } catch (error: Exception) {
                 reason = failureStatus("downlink", error)
@@ -242,9 +311,15 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
             if (!ownsEndpoint()) return
             var offset = 0
             while (offset < count && !manager.isMicrophoneMute) {
-                check(active.track.routedDevice?.type == AudioDeviceInfo.TYPE_TELEPHONY) { "telephony uplink lost its route" }
+                val routedType = active.track.routedDevice?.type
+                if (routedType != AudioDeviceInfo.TYPE_TELEPHONY) {
+                    active.endReason.compareAndSet(null, "uplink_route_lost_type_$routedType")
+                    return
+                }
                 if (!ownsEndpoint()) return
-                val written = active.track.write(buffer, offset, count - offset, AudioTrack.WRITE_NON_BLOCKING)
+                val written = active.endpoint.runAudioWhileAuthorized {
+                    active.track.write(buffer, offset, count - offset, AudioTrack.WRITE_NON_BLOCKING)
+                } ?: return recordDeniedLease(active)
                 check(written >= 0) { "call track write=$written" }
                 if (written == 0) SystemClock.sleep(5)
                 offset += written
@@ -252,12 +327,52 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
         }
     }
 
+    private fun recordDeniedLease(active: Session, fallback: String? = null) {
+        val reason = if (!callIdentity.matchesCached(active.callId)) "$IDENTITY_LOST${callIdentity.diagnosticStatus()}"
+            else fallback
+        if (reason != null) active.endReason.compareAndSet(null, reason)
+    }
+
+    private fun sendDownlink(active: Session, fd: FileDescriptor, writable: Array<StructPollfd>,
+                             bytes: ByteArray, count: Int, safeCall: () -> Boolean): Boolean {
+        var offset = 0
+        while (offset < count) {
+            if (!active.endpoint.isLive() || !safeCall()) return false
+            val sent = active.endpoint.runWhileAuthorized {
+                try {
+                    Os.sendto(fd, bytes, offset, count - offset,
+                        MSG_DONTWAIT or MSG_NOSIGNAL, null, 0)
+                } catch (error: ErrnoException) {
+                    if (error.errno != OsConstants.EAGAIN) throw error
+                    0
+                }
+            } ?: run {
+                recordDeniedLease(active)
+                return false
+            }
+            if (sent == 0 && Os.poll(writable, 50) > 0 &&
+                (writable[0].revents.toInt() and SOCKET_HANGUP) != 0
+            ) return false
+            offset += sent
+        }
+        return true
+    }
+
     fun revoke(callId: String) {
         val active = session?.takeIf { it.callId == callId } ?: return
-        active.endReason.compareAndSet(null, "identity_revoked_${callIdentity.diagnosticStatus()}")
-        // Wake the PCM workers immediately. Their finally blocks release the audio endpoints.
-        active.live.set(false)
-        runCatching { Os.shutdown(active.socket.fileDescriptor, OsConstants.SHUT_RDWR) }
+        revoke(active, "$IDENTITY_REVOKED${callIdentity.diagnosticStatus()}")
+    }
+
+    fun revokeOffer(token: Long, offer: Long) {
+        val active = session?.takeIf { it.token == token && it.offer == offer } ?: return
+        revoke(active, CONTROLLER_REVOKED)
+    }
+
+    private fun revoke(active: Session, reason: String) {
+        active.endReason.compareAndSet(null, reason)
+        active.endpoint.retire {
+            runCatching { Os.shutdown(active.socket.fileDescriptor, OsConstants.SHUT_RDWR) }
+        }
     }
 
     @Synchronized
@@ -268,11 +383,17 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
     @Synchronized
     private fun close(active: Session, reason: String) {
         if (session !== active) return
+        active.endpoint.retire {
+            runCatching { Os.shutdown(active.socket.fileDescriptor, OsConstants.SHUT_RDWR) }
+        }
         status = active.endReason.get() ?: reason
+        val outcome = "identity=${callIdentity.diagnosticStatus()} endpoint=$status"
+        synchronized(closedOffers) {
+            if (closedOffers.size == 8) closedOffers.removeFirst()
+            closedOffers.addLast(ClosedOffer(active.token, active.offer, outcome))
+        }
+        Log.i("HyperCar", "CALL-AUDIO: shell endpoints stopping token=${active.token} offer=${active.offer} $outcome")
         session = null
-        active.live.set(false)
-        runCatching { Os.shutdown(active.socket.fileDescriptor, OsConstants.SHUT_RDWR) }
-        Log.i("HyperCar", "CALL-AUDIO: shell endpoints closed $status")
         runCatching { active.socket.close() }
         runCatching { active.record.stop() }
         runCatching { active.track.pause() }
@@ -286,6 +407,14 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
         "${stage}_failed_${(error.cause ?: error).javaClass.simpleName}"
 
     companion object {
+        // Linux send flags that Android's public OsConstants does not expose.
+        private const val MSG_DONTWAIT = 0x40
+        private const val MSG_NOSIGNAL = 0x4000
+        private val SOCKET_HANGUP = OsConstants.POLLHUP or OsConstants.POLLERR or OsConstants.POLLNVAL
         const val OPEN_IDENTITY_UNCONFIRMED = "open_identity_unconfirmed"
+        const val IDENTITY_REVOKED = "identity_revoked_"
+        const val IDENTITY_LOST = "identity_lost_"
+        const val CONTROLLER_REVOKED = "controller_revoked"
+        const val CALL_NO_LONGER_ELIGIBLE = "call_no_longer_eligible"
     }
 }
