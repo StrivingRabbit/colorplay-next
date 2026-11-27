@@ -281,7 +281,7 @@ jobs:
         run: |
           set -eu
           {
-            echo "### HyperCar ${VERSION}（正式签名）"
+            echo "### ColorPlay Next ${VERSION}（正式签名）"
             echo
             echo "| 项 | 值 |"
             echo "|---|---|"
@@ -357,7 +357,7 @@ jobs:
           # （未引号 heredoc 里反引号是命令替换，会执行 adb 并把错误写进 notes）。
           # SUBJECT 里的反引号无此问题：变量展开的结果不会被再次求值。
           cat > notes.md <<EOF
-          HyperCar ${VERSION}（正式签名）
+          ColorPlay Next ${VERSION}（正式签名）
 
           **更新说明**：${SUBJECT}
 
@@ -404,14 +404,14 @@ jobs:
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "Release $TAG 已存在，覆盖附件"
             gh release upload "$TAG" "$NAME" --repo "$REPO" --clobber
-            gh release edit "$TAG" --repo "$REPO" --title "HyperCar ${VERSION}" --notes-file notes.md --latest
+            gh release edit "$TAG" --repo "$REPO" --title "ColorPlay Next ${VERSION}" --notes-file notes.md --latest
           else
             # --target 必须指向本次运行的提交：默认会打到默认分支 HEAD，
             # 从非默认分支发布时 tag 会指错提交
             gh release create "$TAG" "$NAME" \
               --repo "$REPO" \
               --target "$GITHUB_SHA" \
-              --title "HyperCar ${VERSION}" \
+              --title "ColorPlay Next ${VERSION}" \
               --notes-file notes.md \
               --latest
           fi

@@ -1,0 +1,59 @@
+name: 修正 Release 品牌名称
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/release-branding.yml]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release 标签；留空修正最新正式版'
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-colorplay-next
+  cancel-in-progress: false
+
+jobs:
+  rename:
+    if: github.repository == 'StrivingRabbit/colorplay-next' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 仅修正标题和正文开头，不触碰标签及安装包
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+          repo = 'StrivingRabbit/colorplay-next'
+          requested = os.environ.get('REQUESTED_TAG', '').strip()
+          if requested and not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta)\.[0-9]+)?', requested):
+              raise SystemExit('非法 Release 标签')
+          endpoint = f'repos/{repo}/releases/' + (f'tags/{requested}' if requested else 'latest')
+          current = json.loads(subprocess.check_output(['gh', 'api', endpoint], text=True))
+          tag = current['tag_name']
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta)\.[0-9]+)?', tag):
+              raise SystemExit('目标不是 ColorPlay Next 支持的版本格式，停止')
+          title = 'ColorPlay Next ' + tag[1:]
+          body = re.sub(r'\AHyperCar(?=\s)', 'ColorPlay Next', current.get('body') or '', count=1)
+          payload = {'name': title, 'body': body}
+          path = Path(os.environ['RUNNER_TEMP']) / 'release-branding.json'
+          path.write_text(json.dumps(payload, ensure_ascii=False))
+          updated = json.loads(subprocess.check_output(['gh', 'api', '--method', 'PATCH',
+              f'repos/{repo}/releases/{int(current["id"])}', '--input', str(path)], text=True))
+          before_assets = [(a['id'], a['name'], a.get('digest')) for a in current.get('assets', [])]
+          after_assets = [(a['id'], a['name'], a.get('digest')) for a in updated.get('assets', [])]
+          if updated['name'] != title or updated['tag_name'] != tag or before_assets != after_assets:
+              raise SystemExit('Release 名称或附件核对不符，请人工检查')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'已修正为 **{title}**。\n\n{updated["html_url"]}\n\n标签、附件及 APK 校验值保持不变。\n')
+          print('Updated release title:', title)
+          PY
