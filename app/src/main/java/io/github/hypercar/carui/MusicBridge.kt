@@ -145,14 +145,15 @@ class MusicNotificationListener : NotificationListenerService() {
     }
 
     companion object {
-        private val main = Handler(Looper.getMainLooper())
-        // Keep the system-granted listener separate from optional media work. requestUnbind
-        // during an idle callback can race requestRebind and leave a bound but idle service.
-        private var connected: MusicNotificationListener? = null
+        // Keep ColorPlay Next's Binder worker separate from upstream listener observations.
         private val rebindPending = java.util.concurrent.atomic.AtomicBoolean(false)
         private val rebindWorker = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
             Thread(task, "music-listener-rebind").apply { isDaemon = true }
         }
+        private val main = Handler(Looper.getMainLooper())
+        // Keep the system-granted listener separate from optional media work. requestUnbind
+        // during an idle callback can race requestRebind and leave a bound but idle service.
+        private var connected: MusicNotificationListener? = null
 
         private fun shouldListen() = HyperCarRepo.automaticConnectionAllowed ||
             HyperCarRepo.hasCurrentSession

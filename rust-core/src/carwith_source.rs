@@ -114,10 +114,6 @@ impl Drop for Prepared {
 struct Slot {newest:u64, current:Option<Prepared>}
 static SOURCE: Lazy<Mutex<Slot>>=Lazy::new(||Mutex::new(Slot::default()));
 
-pub(crate) fn awaiting_startup(owner: u64) -> bool {
-    SOURCE.lock().current.as_ref().is_some_and(|source| source.owner == owner && source.stop.awaiting_startup())
-}
-
 pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     let mut slot=SOURCE.lock();
     if slot.current.as_ref().is_some_and(|s|s.owner==owner) {return Ok(());}
@@ -176,6 +172,11 @@ pub(crate) fn stop(owner:u64) {
     slot.newest = slot.newest.max(owner);
     if slot.current.as_ref().is_some_and(|s|s.owner==owner) {slot.current=None;}
 }
+// Fork startup admission stays separate from upstream's evolving prepare signature.
+pub(crate) fn awaiting_startup(owner: u64) -> bool {
+    SOURCE.lock().current.as_ref().is_some_and(|source| source.owner == owner && source.stop.awaiting_startup())
+}
+
 pub(crate) fn diagnostic_phase(owner: u64) -> Option<Arc<crate::carlife::DiagnosticPhase>> {
     SOURCE.lock().current.as_ref().filter(|source| source.owner == owner)
         .map(|source| source.stop.diagnostic_phase())

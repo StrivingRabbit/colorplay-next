@@ -248,7 +248,7 @@ def main():
             conflicts = git('diff', '--name-only', '--diff-filter=U').splitlines()
             unresolved = [p for p in conflicts if not any(p == owned or p.startswith(owned + '/') for owned in PROTECTED)]
             if unresolved or not conflicts:
-                raise RuntimeError('业务源码冲突，必须人工处理：' + repr(unresolved))
+                raise RuntimeError(f'业务源码冲突，必须人工处理（上游 {tag} @ {target}）：' + repr(unresolved))
         git('restore', '--source=' + original, '--staged', '--worktree', '--', *PROTECTED)
         tree = git('write-tree')
         if any(git('rev-parse', tree + ':' + p) != blob for p, blob in saved.items()):
