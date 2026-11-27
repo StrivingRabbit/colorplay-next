@@ -277,7 +277,12 @@ fn carwith_preflight_logs_only_first_access_unit_until_streaming() {
 
 // All CarWith entries share the same local ports. Each task joins its predecessor, including
 // a predecessor cancelled before it got a turn, so a third attempt cannot overtake the first.
+#[cfg(not(test))]
 static LAST_DIALER: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+// 测试使用独立的随机端口；只串行化属于同一组监听器的拨号任务。
+#[cfg(test)]
+static TEST_DIALERS: once_cell::sync::Lazy<Mutex<std::collections::HashMap<(String, [u16; 7]), Option<tokio::task::JoinHandle<()>>>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 pub struct CarLifeHub {
     stop: Arc<DialStop>,
@@ -323,7 +328,12 @@ impl CarLifeHub {
         let input_queue=queue.clone();
         let events_task=events.clone(); let size=encoder_size.clone(); let config=cfg.clone();
         let hub_stop = stop.clone();
+        #[cfg(not(test))]
         let mut last_dialer = LAST_DIALER.lock();
+        #[cfg(test)]
+        let mut test_dialers = TEST_DIALERS.lock();
+        #[cfg(test)]
+        let last_dialer = test_dialers.entry((md_host.clone(), ports)).or_default();
         let previous = last_dialer.take();
         *last_dialer = Some(tokio::spawn(async move {
             if let Some(previous) = previous { let _ = previous.await; }

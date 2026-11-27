@@ -125,6 +125,23 @@ fn actual_plain_version_rejection_retries_encrypted_immediately() {
 }
 
 #[tokio::test]
+async fn independent_listener_sets_do_not_wait_for_another_tests_dialer() {
+    let (first_listeners, first_ports) = listeners().await;
+    let (second_listeners, second_ports) = listeners().await;
+    let first_stop = Arc::new(DialStop::default());
+    let second_stop = Arc::new(DialStop::default());
+    let (_first, _first_events) = CarLifeHub::connect_to_ports(config(), "127.0.0.1".into(),
+        first_ports, first_stop.clone(), None, |_| {}).unwrap();
+    let _first_cmd = accept(&first_listeners[0]).await;
+    let (_second, _second_events) = CarLifeHub::connect_to_ports(config(), "127.0.0.1".into(),
+        second_ports, second_stop.clone(), None, |_| {}).unwrap();
+    let connected = tokio::time::timeout(Duration::from_secs(1), second_listeners[0].accept()).await;
+    first_stop.cancel();
+    second_stop.cancel();
+    assert!(connected.is_ok(), "独立监听器不能等待另一个测试的活动拨号任务");
+}
+
+#[tokio::test]
 async fn pre_auth_secondary_eof_reconnects_that_lane_without_losing_cmd() {
     let (listeners, ports) = listeners().await;
     let stop = Arc::new(DialStop::default());
