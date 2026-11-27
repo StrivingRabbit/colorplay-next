@@ -50,6 +50,24 @@ async fn plain_start(cmd: &mut TcpStream) {
     assert_eq!(frame(cmd).await.0, CMD_VIDEO_ENCODER_START);
 }
 
+// Keep fork-only isolation coverage away from upstream protocol-sequence cases.
+#[tokio::test]
+async fn independent_listener_sets_do_not_wait_for_another_tests_dialer() {
+    let (first_listeners, first_ports) = listeners().await;
+    let (second_listeners, second_ports) = listeners().await;
+    let first_stop = Arc::new(DialStop::default());
+    let second_stop = Arc::new(DialStop::default());
+    let (_first, _first_events) = CarLifeHub::connect_to_ports(config(), "127.0.0.1".into(),
+        first_ports, first_stop.clone(), None, |_| {}).unwrap();
+    let _first_cmd = accept(&first_listeners[0]).await;
+    let (_second, _second_events) = CarLifeHub::connect_to_ports(config(), "127.0.0.1".into(),
+        second_ports, second_stop.clone(), None, |_| {}).unwrap();
+    let connected = tokio::time::timeout(Duration::from_secs(1), second_listeners[0].accept()).await;
+    first_stop.cancel();
+    second_stop.cancel();
+    assert!(connected.is_ok(), "独立监听器不能等待另一个测试的活动拨号任务");
+}
+
 async fn accept_round(listeners: &[TcpListener]) -> Vec<TcpStream> {
     let mut peers = Vec::new();
     for listener in listeners { peers.push(accept(listener).await); }
@@ -79,9 +97,9 @@ async fn encrypted_start(cmd:&mut TcpStream,late_video:Option<u16>) -> (Vec<u8>,
     let (id,features)=frame(cmd).await;assert_eq!(id,CMD_HU_FEATURE_CONFIG_RESPONSE);
     assert!(features.windows(18).any(|bytes|bytes==b"CONTENT_ENCRYPTION"));
     send(cmd,CMD_MD_RSA_KEY_REQUEST,&[]).await;
-    // RSA-2048 generation is CPU-bound and variable on shared hosts; keep ordinary
-    // protocol frames at 3s and all startup/fallback deadline assertions unchanged.
-    let (id,public)=frame_with_timeout(cmd, Duration::from_secs(30)).await;assert_eq!(id,CMD_HU_RSA_PUBLIC_KEY);
+    // Key generation is randomized and uses the authenticated handshake budget.
+    let (id,public)=frame_with_timeout(cmd, Duration::from_secs(30)).await;
+    assert_eq!(id,CMD_HU_RSA_PUBLIC_KEY);
     let der=base64::Engine::decode(&base64::engine::general_purpose::STANDARD,pb_first_string(&public,1).unwrap()).unwrap();
     let key=rsa::RsaPublicKey::from_public_key_der(&der).unwrap();
     let seed=vec![17;16];
@@ -127,23 +145,6 @@ fn actual_plain_version_rejection_retries_encrypted_immediately() {
     assert!(plain.receive(CMD_VERSION_MATCH_STATUS, &[8, 2], &cfg).is_err());
     assert!(choice.round_ended(plain.protocol_evidence(), RoundEnd::Command));
     assert_eq!(choice.current(), CarLifeDialect::CarWithEncrypted41);
-}
-
-#[tokio::test]
-async fn independent_listener_sets_do_not_wait_for_another_tests_dialer() {
-    let (first_listeners, first_ports) = listeners().await;
-    let (second_listeners, second_ports) = listeners().await;
-    let first_stop = Arc::new(DialStop::default());
-    let second_stop = Arc::new(DialStop::default());
-    let (_first, _first_events) = CarLifeHub::connect_to_ports(config(), "127.0.0.1".into(),
-        first_ports, first_stop.clone(), None, |_| {}).unwrap();
-    let _first_cmd = accept(&first_listeners[0]).await;
-    let (_second, _second_events) = CarLifeHub::connect_to_ports(config(), "127.0.0.1".into(),
-        second_ports, second_stop.clone(), None, |_| {}).unwrap();
-    let connected = tokio::time::timeout(Duration::from_secs(1), second_listeners[0].accept()).await;
-    first_stop.cancel();
-    second_stop.cancel();
-    assert!(connected.is_ok(), "独立监听器不能等待另一个测试的活动拨号任务");
 }
 
 #[tokio::test]
