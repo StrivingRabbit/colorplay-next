@@ -8,6 +8,8 @@ on:
       - tools/prepare-official-release.py
       - tools/test_prepare_official_release.py
       - tools/test_alpha_signing.py
+      - tools/publish-official-release.py
+      - tools/test_publish_official_release.py
   schedule:
     - cron: '17 * * * *'
   workflow_dispatch:
@@ -34,6 +36,7 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
+      actions: read # Recovery verifies the prior run's completed validation steps.
     defaults:
       run:
         shell: bash
@@ -60,6 +63,32 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git show origin/main:tools/prepare-official-release.py > "$RUNNER_TEMP/prepare-official-release.py"
+          python3 tools/test_publish_official_release.py
+          # Narrow recovery for the already validated 0.2.13 candidate. No rebuild,
+          # tag replacement, or version increment; the helper verifies the original run.
+          RECOVER_0213=$(python3 - <<'PYRECOVER'
+          import base64, json, subprocess
+          from pathlib import Path
+          provenance = Path('.github/official-release.json')
+          record = json.loads(provenance.read_text()) if provenance.exists() else {}
+          if record.get('version') != '0.2.13' or record.get('release_id') != 460390326:
+              print('false')
+          else:
+              payload = json.loads(subprocess.check_output(['gh', 'api',
+                  'repos/StrivingRabbit/colorplay-next/contents/state.json?ref=official-release-state'], text=True))
+              state = json.loads(base64.b64decode(payload['content']))
+              print('false' if 460390326 in state['completed'] else 'true')
+          PYRECOVER
+          )
+          if [ "$RECOVER_0213" = true ]; then
+            python3 tools/publish-official-release.py --tag v0.2.13 \
+              --candidate 60ea9a2561825f0de0c5be6ab7890949aabf1a6c --validated-run 45978079839
+            git checkout --detach 60ea9a2561825f0de0c5be6ab7890949aabf1a6c
+            python3 "$RUNNER_TEMP/prepare-official-release.py" --finalize
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo '已恢复经原流水线验证的 0.2.13 草稿并登记游标；未重建或改写标签。' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           ARGS=()
           if [ -n "$REQUESTED_TAG" ]; then ARGS+=(--tag "$REQUESTED_TAG"); fi
           if [ "$ALLOW_BACKFILL" = true ]; then ARGS+=(--allow-backfill); fi
@@ -259,7 +288,9 @@ jobs:
               if digest and digest != 'sha256:' + hashlib.sha256(Path(name).read_bytes()).hexdigest():
                   raise SystemExit('草稿附件摘要与本地验证产物不同，禁止公开')
           PY
-          gh release edit "$TAG" --repo StrivingRabbit/colorplay-next --draft=false --latest
+          # Drafts are not available through GET /releases/tags/{tag}.
+          # Resolve their numeric ID from the authenticated list, then PATCH by ID.
+          python3 tools/publish-official-release.py --tag "$TAG" --candidate "$CANDIDATE"
           ARGS=(--finalize)
           if [ -n "$REQUESTED_TAG" ]; then ARGS+=(--tag "$REQUESTED_TAG"); fi
           if [ "$ALLOW_BACKFILL" = true ]; then ARGS+=(--allow-backfill); fi
