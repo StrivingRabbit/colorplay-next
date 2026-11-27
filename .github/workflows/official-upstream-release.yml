@@ -237,7 +237,7 @@ jobs:
             echo "### ColorPlay Next ${VERSION}（正式版）"
             echo "- versionCode：${CODE}"
             echo "- 上游官方 Release 精确提交：fw867/hypercar @ ${UPSTREAM}"
-            echo "- 本仓库候选提交：$(git rev-parse HEAD)"
+            echo "- 本仓库候选提交：$(git rev-parse "refs/tags/v${VERSION}^{commit}" 2>/dev/null || git rev-parse HEAD)"
             echo "- APK SHA-256：$(cut -d' ' -f1 "$NAME.sha256")"
             echo '- 正式签名证书 SHA-256：e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66'
             echo '- 检查：Rust 全量测试、Android 单元测试、Release Lint、源码 Release 构建、签名校验均通过；未下载上游 APK。'

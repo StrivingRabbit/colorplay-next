@@ -184,8 +184,12 @@ def main():
         if len(own) != 1:
             raise RuntimeError('正式发布尚未完成')
         validate_published(own[0], record['version'])
-        if git('rev-parse', f"refs/tags/v{record['version']}^{{commit}}") != git('rev-parse', 'HEAD'):
-            raise RuntimeError('正式 tag 与已验证候选不一致')
+        # 已推 tag 指向的候选是 HEAD 的祖先；只允许其上叠加元数据提交，源码/版本变化不得推进游标。
+        candidate_commit = git('rev-parse', f"refs/tags/v{record['version']}^{{commit}}")
+        git('merge-base', '--is-ancestor', candidate_commit, 'HEAD')
+        changed = git('diff', '--name-only', '--no-renames', candidate_commit + '..HEAD').splitlines()
+        if any(not (p.startswith('.github/') or p.startswith('tools/') or p in ('README.md', 'AGENTS.md')) for p in changed):
+            raise RuntimeError('正式 tag 与当前 HEAD 之间出现源码或版本变化，禁止推进游标')
         state['completed'].append(rid)
         save_state(state, old_state)
         return
