@@ -1,4 +1,5 @@
 name: 修正 Release 品牌名称
+# Metadata-only updates keep existing APK assets and tags intact.
 
 on:
   push:

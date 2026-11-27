@@ -51,7 +51,7 @@ jobs:
   build:
     name: 构建正式签名 APK
     # 提交信息里带 [skip ci] 就整条流水线不跑（只改文档/注释时省 CI 时间）
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    if: "!contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[metadata-only]')"
     runs-on: ubuntu-latest
     timeout-minutes: 55 # 比 CarDeck 多一步 Rust 交叉编译
     steps:
