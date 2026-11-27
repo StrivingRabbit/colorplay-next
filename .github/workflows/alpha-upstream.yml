@@ -117,7 +117,13 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         run: |
           set -euo pipefail
-          cargo test --manifest-path rust-core/Cargo.toml 2>&1 | tee "$RUNNER_TEMP/alpha-rust-test.log"
+          {
+            echo "Candidate commit: $(git rev-parse HEAD)"
+            echo "Runner: $(uname -srm)"
+            cat version.properties
+            cat app/src/main/java/io/github/hypercar/UpstreamBase.kt
+            RUST_BACKTRACE=1 cargo test --manifest-path rust-core/Cargo.toml
+          } 2>&1 | tee "$RUNNER_TEMP/alpha-rust-test.log"
 
       - name: 编译 Rust 核心层
         if: steps.prepare.outputs.changed == 'true'
