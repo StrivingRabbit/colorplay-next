@@ -117,8 +117,13 @@ object RustCoreBridge {
      * @param socketProvider 后续新端口的 socket 供给
      */
     external fun nativeStart(configJson: String, controlFd: Int, socketProvider: SocketProvider): Boolean
+    fun interface CarWithCanvasValidator {
+        fun isCurrent(): Boolean
+    }
+
     /** Source service survives media engine retries; owner is the connection attempt. */
-    external fun nativePrepareCarWith(configJson: String, owner: Long): Boolean
+    external fun nativePrepareCarWith(configJson: String, owner: Long, cachedWidth: Int, cachedHeight: Int,
+                                      validator: CarWithCanvasValidator?): Boolean
     external fun nativeStopCarWith(owner: Long)
     /** 首次 CMD 连接后永久为 false；用于防止延迟到达的启动请求打断源端。 */
     external fun nativeCarWithAwaitingStartup(owner: Long): Boolean
@@ -146,6 +151,7 @@ object RustCoreBridge {
     external fun nativeRequestHostUi(): Boolean
     /** Bounded claim for a new playback action; the core preserves receiver constraints. */
     external fun nativeRequestAudioOwnership(): Boolean
+    external fun nativeNotifyMediaPlayback(playing: Boolean): Boolean
 
     /** 投喂一帧 H.264（Annex B，本机 MediaCodec 编码输出）。[ptsUs] 为微秒时间戳。 */
     external fun nativePushVideoFrame(data: ByteArray, ptsUs: Long)
@@ -163,7 +169,11 @@ object RustCoreBridge {
     external fun nativeStartNavigationAudio(rate: Int, channels: Int)
     external fun nativeCallAudioArmed(token: Long): Boolean
     external fun nativeOfferCallAudio(token: Long, attempt: Long, rate: Int, socketFd: Int): Boolean
-    external fun nativeTakeCallAudioRetry(token: Long, attempt: Long): Int
+    external fun nativeTryCallOutputJournalLock(fd: Int): Boolean
+
+    /** The registered shell journal retains this shared selector until the UserService exits. */
+    external fun nativeMapCallOutputSelector(fd: Int): java.nio.ByteBuffer?
+    external fun nativeTakeCallAudioResult(token: Long, attempt: Long): Int
     external fun nativePushNavigationAudioPcm(pcm: ShortArray, rate: Int, channels: Int)
     external fun nativeStopNavigationAudio()
 

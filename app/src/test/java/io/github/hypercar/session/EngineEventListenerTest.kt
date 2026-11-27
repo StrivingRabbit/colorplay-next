@@ -10,6 +10,50 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class EngineEventListenerTest {
+    @Test fun screenSetupAndReacquisitionPreserveConnectedProjectionUntilSessionExit() {
+        val gate = EngineCallbackGate()
+        for (exit in listOf("negotiating", "failed", "ended", "error", "stopping")) {
+            val owner = gate.begin()
+            val target = object : RustCoreBridge.EventListener {
+                override fun onState(state: String, detail: String) {
+                    if (state == "connected") gate.setProjection(owner, true)
+                }
+                override fun onLog(line: String) {}
+                override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {}
+                override fun onNightMode(night: Boolean) {}
+            }
+            val listener = EngineEventListener(gate, owner, target)
+            listener.onState("activation", "RECORD")
+            assertNull(gate.projectionOwner.value)
+            listener.onState("connected", "control ready")
+            assertEquals(owner, gate.projectionOwner.value)
+            repeat(2) {
+                for (stage in listOf("SCREEN_SETUP", "VIDEO_CHANNEL_READY")) {
+                    listener.onState("activation", stage)
+                    assertEquals(stage, owner, gate.projectionOwner.value)
+                }
+            }
+            listener.onState(exit, "")
+            assertNull(exit, gate.projectionOwner.value)
+        }
+    }
+
+    @Test fun retiredEngineCanReportItsCallAudioShutdownWithoutRearmingAudio() {
+        val gate = EngineCallbackGate()
+        val received = mutableListOf<Pair<String, String>>()
+        val target = object : RustCoreBridge.EventListener {
+            override fun onState(state: String, detail: String) { received += state to detail }
+            override fun onLog(line: String) {}
+            override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {}
+            override fun onNightMode(night: Boolean) {}
+        }
+        val old = EngineEventListener(gate, gate.begin(), target)
+        gate.retire()
+        old.onState("call_audio_armed", "7 16000")
+        old.onState("call_audio_stopping", "7 offer=3")
+        assertEquals(listOf("call_audio_stopping" to "7 offer=3"), received)
+    }
+
     @Test fun lateScreenSnapshotsCannotRestoreBufferedBadgeAfterFallbackOrSamePeerReinvite() {
         val gate = EngineCallbackGate()
         var shown = io.github.hypercar.core.PipelineDiagnostics()

@@ -291,23 +291,28 @@ impl CryptoWork {
     }
 }
 
-fn is_authentication_command(kind: u32) -> bool {
-    matches!(kind, CMD_MD_AUTHEN_RESPONSE | CMD_MD_RSA_KEY_REQUEST | CMD_MD_AES_SEED | CMD_MD_ENCRYPT_READY)
+fn is_encryption_handshake(dialect: CarLifeDialect, kind: u32) -> bool {
+    match kind {
+        CMD_MD_AUTHEN_RESPONSE => dialect != CarLifeDialect::SystemPlain32,
+        CMD_MD_RSA_KEY_REQUEST | CMD_MD_AES_SEED | CMD_MD_ENCRYPT_READY => true,
+        _ => false,
+    }
 }
 
-fn observe_buffered_authentication(progress: &Progress, mut buffered: &[u8]) {
+fn observe_buffered_authentication(progress: &Progress, dialect: CarLifeDialect, mut buffered: &[u8]) {
     // The AES seed cannot be installed before authentication is observed, so
     // only the pre-key stream needs this lookahead. Leave validation and all
     // protocol side effects in their original wire order.
     if progress.authentication.load(Ordering::Relaxed) { return; }
     while let Some((kind, _, consumed)) = cmd_frame_parts(buffered) {
-        if is_authentication_command(kind) {
+        if is_encryption_handshake(dialect, kind) {
             progress.authentication.store(true, Ordering::Relaxed);
             return;
         }
         buffered = &buffered[consumed..];
     }
 }
+
 fn navigation_subscription()->Vec<u8> {
     let mut module=Vec::new();proto::varint(&mut module,1,0);
     let mut list=Vec::new();proto::varint(&mut list,1,1);proto::bytes(&mut list,2,&module);list
@@ -322,7 +327,7 @@ impl Session {
     pub(super) fn navigation_ready(&self) -> bool {
         match self.dialect {
             CarLifeDialect::CarWithEncrypted41 => self.proof_ok && self.admitted && self.ready,
-            CarLifeDialect::SystemPlain30 => self.started && self.matched && self.info.is_some() && self.init_sent,
+            CarLifeDialect::SystemPlain30 | CarLifeDialect::SystemPlain32 => self.started && self.matched && self.info.is_some() && self.init_sent,
             CarLifeDialect::SystemAuto => false,
         }
     }
@@ -330,7 +335,7 @@ impl Session {
     pub(super) fn protocol_evidence(&self) -> super::protocol_selection::Evidence {
         self.protocol_progress.evidence()
     }
-    pub(super) fn is_system_plain(&self) -> bool { self.dialect == CarLifeDialect::SystemPlain30 }
+    pub(super) fn is_system_plain(&self) -> bool { self.dialect.is_system_plain() }
     pub(super) fn media_ready(&self) -> bool {
         // Audio lanes retain their format and playback during video reconfiguration.
         self.started || (self.is_system_plain() && self.encoder_epoch!=0)
@@ -377,11 +382,15 @@ impl Session {
     pub fn decrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, String> { crypt(bytes, self.seed.as_deref(), false) }
 
     fn observe_command(&self, kind: u32, body: &[u8]) {
-        if is_authentication_command(kind) {
+        if is_encryption_handshake(self.dialect, kind) {
             self.protocol_progress.authentication.store(true, Ordering::Relaxed);
         }
-        if kind == CMD_VERSION_MATCH_STATUS && matches!(first_int(body, 1), Some(0 | 2)) {
-            self.protocol_progress.version_rejected.store(true, Ordering::Relaxed);
+        if kind == CMD_VERSION_MATCH_STATUS {
+            match first_int(body, 1) {
+                Some(1) => self.protocol_progress.version_matched.store(true, Ordering::Relaxed),
+                Some(0 | 2) => self.protocol_progress.version_rejected.store(true, Ordering::Relaxed),
+                _ => {}
+            }
         }
     }
 
@@ -413,15 +422,15 @@ impl Session {
 
     fn receive_prepared(&mut self, kind: u32, body: &[u8], cfg: &CarLifeConfig, crypto: Option<CommandCrypto>) -> Result<Vec<Action>, String> {
         let mut out = Vec::new();
-        let plain = self.dialect == CarLifeDialect::SystemPlain30;
-        // Admission alone does not imply CONTENT_ENCRYPTION. A plaintext round
-        // still cannot accept a challenge proof or acquire an AES seed.
-        if plain && is_authentication_command(kind) {
-            return Err("encrypted handshake message in SystemPlain30".into());
+        let plain = self.is_system_plain();
+        let plain_32 = self.dialect == CarLifeDialect::SystemPlain32;
+        // 3.2 uses the box's version check without negotiating a content key.
+        if plain && is_encryption_handshake(self.dialect, kind) {
+            return Err(format!("encrypted handshake message in {:?}", self.dialect));
         }
         match kind {
             CMD_MD_AUTHEN_RESULT if plain => {
-                if !self.matched || self.info.is_none() || first_int(body,1)!=Some(1) {
+                if !self.matched || (!plain_32 && self.info.is_none()) || first_int(body,1)!=Some(1) {
                     return Err("plaintext admission rejected/out of order".into());
                 }
                 self.admitted=true;
@@ -429,18 +438,25 @@ impl Session {
             }
             CMD_VERSION_MATCH_STATUS if plain => {
                 if first_int(body, 1) != Some(1) { return Err("protocol version rejected".into()); }
-                if !self.matched { out.push((CMD_HU_STATISTIC_INFO, proto_statistic_payload())); }
+                if !self.matched {
+                    out.push((CMD_HU_STATISTIC_INFO, proto_statistic_payload()));
+                    if plain_32 {
+                        let mut request = Vec::new();
+                        proto::string(&mut request, 1, "CarLife_1.0.0");
+                        out.push((CMD_HU_AUTHEN_REQUEST, request));
+                    }
+                }
                 self.matched = true;
             }
             CMD_MD_INFO if plain => {
                 if self.info.is_none() {
-                    self.info = Some((String::new(), String::new(), String::new()));
+                    self.info = Some(Default::default());
                     let mut identity=cfg.clone();
                     if let Some((w,h))=self.declared_display { identity.width=w;identity.height=h; }
                     out.push((CMD_HU_INFO, proto_hu_info_payload(&identity)));
                 }
             }
-            CMD_MD_FEATURE_CONFIG_REQUEST if plain => {}
+            CMD_MD_FEATURE_CONFIG_REQUEST if plain => { self.features_requested |= plain_32; }
             0x10026 if plain => {
                 if let Some(control)=system_module_control(body) { out.push((0x18028,control)); }
             }
@@ -475,6 +491,9 @@ impl Session {
                 out.push((CMD_HU_INFO, proto_hu_info_payload(cfg)));
                 out.push((CMD_HU_AUTHEN_REQUEST, request));
             }
+            // The box treats this legacy version response as informational.
+            // The local CarLife service separately grants admission to the stream.
+            CMD_MD_AUTHEN_RESPONSE if plain_32 => {}
             CMD_MD_AUTHEN_RESPONSE => {
                 let (brand, model, sdk) = self.info.as_ref().ok_or("auth before MD_INFO")?;
                 if self.proof_ok { return Err("duplicate challenge response".into()); }
@@ -553,15 +572,24 @@ impl Session {
             CMD_MD_EXIT => return Err("peer exited CarWith".into()),
             _ => {}
         }
-        if !self.features_sent && ((plain && self.matched && self.info.is_some()) || (!plain && self.proof_ok && self.features_requested)) {
+        let feature_ready = if plain {
+            self.matched && self.info.is_some() && (!plain_32 || self.features_requested)
+        } else {
+            self.proof_ok && self.features_requested
+        };
+        if !self.features_sent && feature_ready {
             self.features_sent = true;
-            let mut features = vec![("CONTENT_ENCRYPTION", u64::from(!plain)), ("VOICE_MIC", u64::from(cfg.microphone.is_none()))];
-            if plain {
+            let mut features = if plain_32 {
+                vec![("FOCUS_UI", 0), ("VOICE_MIC", 1), ("AUDIO_TRANSMISSION_MODE", 0)]
+            } else {
+                vec![("CONTENT_ENCRYPTION", u64::from(!plain)), ("VOICE_MIC", u64::from(cfg.microphone.is_none()))]
+            };
+            if plain && !plain_32 {
                 features.push(("CONNECT_TYPE", 5));
                 features.push(("I_FRAME_INTERVAL", 20));
                 self.feature_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
             }
-            if plain || self.declared_display.is_some() {
+            if !plain_32 && (plain || self.declared_display.is_some()) {
                 features.push(("DISABLE_RESOLUTION_OPTION", 1));
             }
             let mut payload = Vec::new();
@@ -572,15 +600,21 @@ impl Session {
                 proto::varint(&mut entry, 2, value);
                 proto::bytes(&mut payload, 2, &entry);
             }
-            if plain {
+            if plain && !plain_32 {
                 proto::varint(&mut payload,3,0);
                 proto::string(&mut payload,4,&cfg.bt_name);
                 proto::string(&mut payload,5,&cfg.bt_address);
             }
             out.push((CMD_HU_FEATURE_CONFIG_RESPONSE, payload));
         }
-        let plain_init = plain && self.features_sent && (self.feature_ack || self.feature_deadline.is_some_and(|at| tokio::time::Instant::now() >= at));
-        if !self.init_sent && (plain_init || (!plain && self.proof_ok && self.admitted && self.ready)) {
+        let init_ready = if plain_32 {
+            self.features_sent && self.admitted
+        } else if plain {
+            self.features_sent && (self.feature_ack || self.feature_deadline.is_some_and(|at| tokio::time::Instant::now() >= at))
+        } else {
+            self.proof_ok && self.admitted && self.ready
+        };
+        if !self.init_sent && init_ready {
             self.init_sent = true;
             self.init_fps = Some(cfg.fps);
             let (width,height) = self.declared_display.unwrap_or((cfg.width,cfg.height));
@@ -694,7 +728,7 @@ async fn write_system_voice(wr:&mut tokio::net::tcp::OwnedWriteHalf, state:&Shar
     let written=tokio::time::timeout(Duration::from_millis(250),send_cmd(wr,0x68008,&body)).await;
     if !matches!(written,Ok(true)) { return Err("System CarLife voice command write failed".into()); }
     state.lock().voice_lease=if key==0x21 {Some(tokio::time::Instant::now()+Duration::from_secs(60))} else {None};
-    emit_log(&format!("VOICE-KEY: System CMD 0x68008 key=0x{key:x} written (recognition unconfirmed)"));
+    crate::emit_hid_log(&format!("VOICE-KEY: System CMD 0x68008 key=0x{key:x} written (recognition unconfirmed)"));
     Ok(())
 }
 
@@ -711,10 +745,59 @@ pub(super) async fn handshake_deadline(progress: &Progress) {
     }
 }
 
+async fn write_guarded_init(
+    wr: &mut tokio::net::tcp::OwnedWriteHalf,
+    id: u32,
+    requested: &DisplayRequest,
+    cfg: &CarLifeConfig,
+    state: &Shared,
+) -> Result<bool, String> {
+    let Some(hint) = cfg.cached_system_canvas.as_ref().filter(|_| id == CMD_VIDEO_ENCODER_INIT) else {
+        return Ok(false);
+    };
+    loop {
+        wr.writable().await.map_err(|e| e.to_string())?;
+        let display = *requested.borrow();
+        let ((width, height), source) = if display.size.0 >= 2 && display.size.1 >= 2 {
+            (display.size, "receiver")
+        } else if (hint.is_current)() {
+            (hint.size, "receiver_cache")
+        } else {
+            ((cfg.width, cfg.height), "manual")
+        };
+        let (w, h) = canvas_for_receiver(width, height);
+        let fps = display.effective_fps(cfg.fps);
+        let body = proto_encoder_info_payload(w, h, fps);
+        let wire = state.lock().encrypt(&body)?;
+        let frame = build_cmd_frame(id, &wire);
+        // Choose again after WouldBlock. Once TCP has accepted a prefix, finish that frame.
+        let written = match wr.try_write(&frame) {
+            Ok(0) => return Err("CarLife INIT write returned zero".into()),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(format!("CarLife INIT write failed: {e}")),
+        };
+        wr.write_all(&frame[written..]).await.map_err(|e| e.to_string())?;
+        let _ = wr.flush().await;
+        {
+            let mut session = state.lock();
+            session.init_canvas = Some((w, h));
+            session.init_fps = Some(fps);
+        }
+        emit_log(&format!("CARWITH-HS: TX 0x{id:x} payload={}B wire={}B", body.len(), wire.len()));
+        emit_log(&format!("CARWITH-SIZE: receiver={width}x{height} request={w}x{h} cap=2560x2560 requested_fps={} effective_fps={fps} canvas_source={source}", cfg.fps));
+        return Ok(true);
+    }
+}
+
 pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLifeEvent>,
     size: Arc<Mutex<(u32,u32)>>, requested: DisplayRequest, cfg: CarLifeConfig, state: Shared, reset_request: Arc<Notify>, can_reopen_display: bool) -> Result<(),String> {
     let (mut rd, mut wr) = stream.into_split();
-    let version = if cfg.dialect == CarLifeDialect::SystemPlain30 { vec![8, 3, 16, 0] } else { proto_version_payload() };
+    let version = match cfg.dialect {
+        CarLifeDialect::SystemPlain30 => vec![8, 3, 16, 0],
+        CarLifeDialect::SystemPlain32 => vec![8, 3, 16, 2],
+        _ => proto_version_payload(),
+    };
     if !send_cmd(&mut wr, CMD_HU_PROTOCOL_VERSION, &version).await { return Err("version write failed".into()); }
     #[cfg(test)]
     log::info!(target: "carwith_probe", "CMD TX written id=0x{CMD_HU_PROTOCOL_VERSION:x}");
@@ -730,7 +813,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
     let protocol_progress = state.lock().protocol_progress.clone();
     let mut next_gps = tokio::time::Instant::now();
     let mut gps_sent = 0_u64;
-    let system_plain = cfg.dialect == CarLifeDialect::SystemPlain30;
+    let system_plain = cfg.dialect.is_system_plain();
     let (mut rate_failures, source_sync) = {
         let session = state.lock();
         (session.video_rate_failure.subscribe(), session.video_sync_received.as_ref().map(watch::Sender::subscribe))
@@ -782,16 +865,17 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
         let feature_deadline = state.lock().feature_timeout();
         let voice_deadline = state.lock().voice_lease;
         let read = tokio::select! {
-            _ = reconfigure_request.notified(), if cfg.dialect==CarLifeDialect::SystemPlain30 => {
+            _ = reconfigure_request.notified(), if system_plain => {
                 let display=*requested.borrow();
                 let mut epoch_cfg=cfg.clone();epoch_cfg.fps=display.effective_fps(cfg.fps);
                 let actions=state.lock().reconfigure(display,&epoch_cfg)?;
                 for (id,body) in actions {
+                    if write_guarded_init(&mut wr, id, &requested, &cfg, &state).await? { continue; }
                     if !send_cmd(&mut wr,id,&body).await { return Err("System CarLife reconfiguration write failed".into()); }
                 }
                 continue;
             }
-            _ = voice_request.notified(), if cfg.dialect==CarLifeDialect::SystemPlain30 => {
+            _ = voice_request.notified(), if system_plain => {
                 let requested = state.lock().take_voice();
                 if let Some(key) = requested {
                     let active=state.lock().voice_lease.is_some();
@@ -803,7 +887,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                 }
                 continue;
             }
-            _ = async {tokio::time::sleep_until(voice_deadline.unwrap()).await}, if voice_deadline.is_some() && cfg.dialect==CarLifeDialect::SystemPlain30 => {
+            _ = async {tokio::time::sleep_until(voice_deadline.unwrap()).await}, if voice_deadline.is_some() && system_plain => {
                 write_system_voice(&mut wr,&state,0x22).await?;
                 continue;
             }
@@ -817,6 +901,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                     session.receive_prepared(u32::MAX, &[], &timer_cfg, None)?
                 };
                 for (id, body) in actions {
+                    if write_guarded_init(&mut wr, id, &requested, &cfg, &state).await? { continue; }
                     let wire = state.lock().encrypt(&body)?;
                     if !send_cmd(&mut wr, id, &wire).await { return Err("System CarLife INIT timer write failed".into()); }
                 }
@@ -868,7 +953,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
         let n=read.map_err(|e|e.to_string())?;
         if n==0 { return Err("CarWith command EOF".into()); }
         buf.extend_from_slice(&chunk[..n]);
-        observe_buffered_authentication(&protocol_progress, &buf);
+        observe_buffered_authentication(&protocol_progress, cfg.dialect, &buf);
         while let Some((kind, payload, consumed)) = read_cmd_frame(&buf) {
             // Production RX diagnostics below run after processing, which can include key generation.
             #[cfg(test)]
@@ -919,6 +1004,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                 let _ = events.send(CarLifeEvent::GoToDesktop);
             }
             for (id,body) in actions {
+                if write_guarded_init(&mut wr, id, &requested, &cfg, &state).await? { continue; }
                 let encrypted=state.lock().encrypt(&body)?;
                 if !send_cmd(&mut wr,id,&encrypted).await { return Err(format!("CarWith write 0x{id:x} failed")); }
                 emit_log(&format!("CARWITH-HS: TX 0x{id:x} payload={}B wire={}B",body.len(),encrypted.len()));
@@ -934,7 +1020,12 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                     state.lock().video_start_written.notify_one();
                     emit_log("CARWITH-NAV: authenticated CMD/DATA monitoring 0x10030; dashboard card alone does not confirm HUD output");
                     let _=events.send(CarLifeEvent::Handshake);
-                    emit_state("carlife_active", if cfg.dialect == CarLifeDialect::SystemPlain30 { "System CarLife 3.0 plaintext video START sent" } else { "CarWith proof/admission/encryption complete; video START sent" });
+                    let state = match cfg.dialect {
+                        CarLifeDialect::SystemPlain30 => "System CarLife 3.0 plaintext video START sent",
+                        CarLifeDialect::SystemPlain32 => "System CarLife 3.2 plaintext video START sent",
+                        _ => "CarWith proof/admission/encryption complete; video START sent",
+                    };
+                    emit_state("carlife_active", state);
                 }
             }
         }
@@ -1039,7 +1130,7 @@ pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<QueuedCo
                                 gesture = next;
                                 gesture_grant = if gesture.active { report.grant } else { None };
                                 sent += 1;
-                                if sent <= 8 || sent % 60 == 0 { emit_log(&format!("CARWITH-TOUCH: encrypted CTRL report #{sent}")); }
+                                if sent <= 8 || sent % 60 == 0 { crate::emit_hid_log(&format!("CARWITH-TOUCH: encrypted CTRL report #{sent}")); }
                             }
                             Ok(false) => {}
                             Err(_) => return,
@@ -1064,13 +1155,13 @@ pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<QueuedCo
                 }
             }
             if packet.expires.is_some_and(|at|std::time::Instant::now()>=at) {
-                if let Some(code) = phone_key { emit_log(&format!("PHONE-KEY: key={code} dropped expired")); }
+                if let Some(code) = phone_key { crate::emit_hid_log(&format!("PHONE-KEY: key={code} dropped expired")); }
                 continue;
             }
             let wire={
                 let s=state.lock();
                 if phone_key.is_some() && (s.dialect != CarLifeDialect::CarWithEncrypted41 || !s.started || !s.navigation_ready()) {
-                    emit_log("PHONE-KEY: dropped before authenticated CarWith source ready");
+                    crate::emit_hid_log("PHONE-KEY: dropped before authenticated CarWith source ready");
                     continue;
                 }
                 if !s.started { if packet.expires.is_some(){emit_log("CARWITH-CTRL: source not ready; command dropped");} continue; }
@@ -1078,18 +1169,18 @@ pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<QueuedCo
                 build_cmd_frame(kind,&body)
             };
             if stream.write_all(&wire).await.is_err(){
-                if let Some(code) = phone_key { emit_log(&format!("PHONE-KEY: key={code} CTRL write failed")); }
+                if let Some(code) = phone_key { crate::emit_hid_log(&format!("PHONE-KEY: key={code} CTRL write failed")); }
                 return;
             }
             sent+=1;
-            if let Some(code) = phone_key { emit_log(&format!("PHONE-KEY: encrypted CTRL written key={code} (execution unconfirmed)")); }
+            if let Some(code) = phone_key { crate::emit_hid_log(&format!("PHONE-KEY: encrypted CTRL written key={code} (execution unconfirmed)")); }
             if let Some(code) = hard_key {
                 last_selector = selector.map(|key| (key, std::time::Instant::now()));
                 if code == 0x21 || sent <= 8 || sent % 60 == 0 {
-                    emit_log(&format!("CARWITH-KEY: encrypted CTRL write key={code}"));
+                    crate::emit_hid_log(&format!("CARWITH-KEY: encrypted CTRL write key={code}"));
                 }
             }
-            if sent<=8 || sent%60==0 {emit_log(&format!("CARWITH-TOUCH: encrypted CTRL packet #{sent} wire={}B",wire.len()));}
+            if sent<=8 || sent%60==0 {crate::emit_hid_log(&format!("CARWITH-TOUCH: encrypted CTRL packet #{sent} wire={}B",wire.len()));}
         } else {
             let plain=state.lock().is_system_plain();
             tokio::select! {
@@ -1284,7 +1375,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1),writer).await.unwrap().unwrap();
     }
     use tokio::net::TcpListener;
-    fn cfg()->CarLifeConfig {CarLifeConfig{dialect:CarLifeDialect::default(),manufacturer:String::new(),model:String::new(),width:1280,height:720,fps:60,navigation_updates:false,microphone:None,vehicle_gps:None,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
+    fn cfg()->CarLifeConfig {CarLifeConfig{dialect:CarLifeDialect::default(),manufacturer:String::new(),model:String::new(),width:1280,height:720,fps:60,cached_system_canvas:None,navigation_updates:false,microphone:None,vehicle_gps:None,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
 
     #[test]
     fn vehicle_gps_requires_this_command_sessions_gps_subscription_and_encryption() {
@@ -2085,7 +2176,7 @@ mod navigation_tests {
 #[cfg(test)]
 mod navigation_subscription_tests {
     use super::*;
-    fn config(enabled:bool)->CarLifeConfig {CarLifeConfig{dialect:CarLifeDialect::default(),manufacturer:String::new(),model:String::new(),width:1280,height:720,fps:30,navigation_updates:enabled,microphone:None,vehicle_gps:None,bt_address:String::new(),bt_name:String::new()}}
+    fn config(enabled:bool)->CarLifeConfig {CarLifeConfig{dialect:CarLifeDialect::default(),manufacturer:String::new(),model:String::new(),width:1280,height:720,fps:30,cached_system_canvas:None,navigation_updates:enabled,microphone:None,vehicle_gps:None,bt_address:String::new(),bt_name:String::new()}}
     fn ready()->Session {let mut s=Session::default();s.proof_ok=true;s.admitted=true;s.ready=true;s.init_sent=true;s}
     #[test] fn capability_query_ack_then_start_only_once() {
         let mut s=ready();let c=config(true);
@@ -2113,8 +2204,43 @@ mod system_plain_tests {
     use super::*;
     fn cfg() -> CarLifeConfig {
         CarLifeConfig { dialect: CarLifeDialect::SystemPlain30, manufacturer: "BMW".into(), model: "ID8.5".into(),
-            width:1280,height:720,fps:30,navigation_updates:true,microphone:None,vehicle_gps:None,
+            width:1280,height:720,fps:30,cached_system_canvas:None,navigation_updates:true,microphone:None,vehicle_gps:None,
             bt_address:"00:11:22:33:44:55".into(),bt_name:"Actual receiver".into() }
+    }
+    #[tokio::test]
+    async fn system_canvas_hint_is_rechecked_on_the_init_socket() {
+        use std::sync::atomic::AtomicBool;
+        use tokio::net::TcpListener;
+
+        let valid = Arc::new(AtomicBool::new(true));
+        let guard = valid.clone();
+        let mut config = cfg();
+        let cached = (2736, 800);
+        config.cached_system_canvas = Some(SystemCanvasHint {
+            size: cached,
+            is_current: Arc::new(move || guard.load(Ordering::Acquire)),
+        });
+        let requested = DisplayRequest::new(ReceiverDisplay::default());
+        let state = Arc::new(Mutex::new(Session::new(config.dialect)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_, mut writer) = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap().into_split();
+        let (mut peer, _) = listener.accept().await.unwrap();
+
+        for (still_current, live, expected) in [
+            (true, (0, 0), cached),
+            (false, (0, 0), (1280, 720)),
+            (false, (1920, 1080), (1920, 1080)),
+        ] {
+            valid.store(still_current, Ordering::Release);
+            requested.send_replace(ReceiverDisplay { size: live, ..Default::default() });
+            assert!(write_guarded_init(&mut writer, CMD_VIDEO_ENCODER_INIT, &requested, &config, &state).await.unwrap());
+            let canvas = canvas_for_receiver(expected.0, expected.1);
+            let expected_frame = build_cmd_frame(CMD_VIDEO_ENCODER_INIT, &proto_encoder_info_payload(canvas.0, canvas.1, 30));
+            let mut actual = vec![0; expected_frame.len()];
+            peer.read_exact(&mut actual).await.unwrap();
+            assert_eq!(actual, expected_frame);
+            assert_eq!(state.lock().init_canvas, Some(canvas));
+        }
     }
     #[tokio::test]
     async fn system_plain_early_audio_format_and_reconfiguration_pcm_survive_video_epochs() {
