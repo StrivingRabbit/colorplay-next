@@ -19,7 +19,10 @@ async fn accept(listener:&TcpListener) -> TcpStream {
     tokio::time::timeout(Duration::from_secs(3),listener.accept()).await.unwrap().unwrap().0
 }
 async fn frame(socket:&mut TcpStream) -> (u32,Vec<u8>) {
-    tokio::time::timeout(Duration::from_secs(3),async {
+    frame_with_timeout(socket, Duration::from_secs(3)).await
+}
+async fn frame_with_timeout(socket: &mut TcpStream, timeout: Duration) -> (u32, Vec<u8>) {
+    tokio::time::timeout(timeout,async {
         let mut header=[0;8];socket.read_exact(&mut header).await.unwrap();
         let mut body=vec![0;u16::from_be_bytes([header[0],header[1]]) as usize];
         socket.read_exact(&mut body).await.unwrap();
@@ -76,7 +79,9 @@ async fn encrypted_start(cmd:&mut TcpStream,late_video:Option<u16>) -> (Vec<u8>,
     let (id,features)=frame(cmd).await;assert_eq!(id,CMD_HU_FEATURE_CONFIG_RESPONSE);
     assert!(features.windows(18).any(|bytes|bytes==b"CONTENT_ENCRYPTION"));
     send(cmd,CMD_MD_RSA_KEY_REQUEST,&[]).await;
-    let (id,public)=frame(cmd).await;assert_eq!(id,CMD_HU_RSA_PUBLIC_KEY);
+    // RSA-2048 generation is CPU-bound and variable on shared hosts; keep ordinary
+    // protocol frames at 3s and all startup/fallback deadline assertions unchanged.
+    let (id,public)=frame_with_timeout(cmd, Duration::from_secs(30)).await;assert_eq!(id,CMD_HU_RSA_PUBLIC_KEY);
     let der=base64::Engine::decode(&base64::engine::general_purpose::STANDARD,pb_first_string(&public,1).unwrap()).unwrap();
     let key=rsa::RsaPublicKey::from_public_key_der(&der).unwrap();
     let seed=vec![17;16];

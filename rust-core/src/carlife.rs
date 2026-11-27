@@ -333,6 +333,8 @@ impl CarLifeHub {
         #[cfg(test)]
         let mut test_dialers = TEST_DIALERS.lock();
         #[cfg(test)]
+        test_dialers.retain(|_, handle| handle.as_ref().is_some_and(|task| !task.is_finished()));
+        #[cfg(test)]
         let last_dialer = test_dialers.entry((md_host.clone(), ports)).or_default();
         let previous = last_dialer.take();
         *last_dialer = Some(tokio::spawn(async move {
