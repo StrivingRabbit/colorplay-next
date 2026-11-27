@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""验证现有正式草稿并按数值 ID 公开；不创建 Release 或上传附件。"""
+"""幂等创建/复用正式草稿、补齐附件并按数值 ID 公开；从不通过 GET /releases/tags/{tag} 回读草稿。"""
 import argparse
 import importlib.util
 import json
@@ -99,6 +99,33 @@ def validate_prior_run(run_id, candidate):
             raise RuntimeError('历史运行必需门禁未通过：' + name)
 
 
+def list_releases():
+    # The list endpoint is the only read that returns drafts; GET /releases/tags/{tag} 404s for drafts.
+    pages = api(f'repos/{REPO}/releases?per_page=100', paginate=True)
+    return [release for page in pages for release in page]
+
+
+def find_release(tag):
+    matches = [release for release in list_releases() if release.get('tag_name') == tag]
+    if len(matches) > 1:
+        raise RuntimeError('存在多个同 tag 的 Release，禁止发布')
+    return matches[0] if matches else None
+
+
+def create_draft(tag, title, notes_file, assets):
+    command = ['gh', 'release', 'create', tag, *assets,
+               '--repo', REPO, '--verify-tag', '--title', title,
+               '--notes-file', notes_file, '--draft', '--latest=false']
+    subprocess.check_call(command, cwd=ROOT)
+
+
+def ensure_assets(tag, release, assets):
+    present = {asset.get('name') for asset in release.get('assets', [])}
+    for path in assets:
+        if Path(path).name not in present:
+            subprocess.check_call(['gh', 'release', 'upload', tag, path, '--repo', REPO], cwd=ROOT)
+
+
 def validate_release(release, tag, candidate, record, prepare):
     if type(release.get('id')) is not int or release['id'] <= 0 or release.get('tag_name') != tag:
         raise RuntimeError('Release 数值 ID 或 tag 身份不匹配')
@@ -124,16 +151,24 @@ def validate_release(release, tag, candidate, record, prepare):
     prepare.validate_published(dict(release, draft=False), record['version'])
 
 
-def publish(tag, candidate, validated_run=None):
+def publish(tag, candidate, validated_run=None, title=None, notes_file=None, assets=()):
     record, prepare = validate_git_context(tag, candidate, validated_run is not None)
     if validated_run is not None:
         validate_prior_run(validated_run, candidate)
     validate_remote_tag(tag, candidate)
-    pages = api(f'repos/{REPO}/releases?per_page=100', paginate=True)
-    matches = [release for page in pages for release in page if release.get('tag_name') == tag]
-    if len(matches) != 1:
-        raise RuntimeError('必须存在唯一精确 tag 的 Release，缺失时禁止创建或猜测草稿')
-    release = matches[0]
+    release = find_release(tag)
+    if release is None:
+        if not (title and notes_file):
+            raise RuntimeError('必须存在唯一精确 tag 的 Release，缺失时禁止创建或猜测草稿')
+        create_draft(tag, title, notes_file, assets)
+        release = find_release(tag)
+        if release is None:
+            raise RuntimeError('草稿创建后仍无法通过列表定位，禁止继续')
+    if assets:
+        ensure_assets(tag, release, assets)
+        release = find_release(tag)
+        if release is None:
+            raise RuntimeError('草稿附件补传后仍无法定位，禁止继续')
     validate_release(release, tag, candidate, record, prepare)
     if release['draft']:
         if validated_run is not None:
@@ -152,8 +187,11 @@ def main():
     parser.add_argument('--tag', required=True)
     parser.add_argument('--candidate', required=True)
     parser.add_argument('--validated-run')
+    parser.add_argument('--title')
+    parser.add_argument('--notes-file')
+    parser.add_argument('--asset', action='append', default=[])
     args = parser.parse_args()
-    publish(args.tag, args.candidate, args.validated_run)
+    publish(args.tag, args.candidate, args.validated_run, args.title, args.notes_file, tuple(args.asset))
 
 
 if __name__ == '__main__':

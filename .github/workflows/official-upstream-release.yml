@@ -269,28 +269,12 @@ jobs:
           # CAS 同时保护人工更新；main 仅允许从准备时基线快进，绝不改写已有 tag。
           git push --atomic "--force-with-lease=refs/heads/main:$BASE" origin \
             HEAD:refs/heads/main "refs/tags/$TAG:refs/tags/$TAG"
-          gh release create "$TAG" "$NAME" "$NAME.sha256" \
-            --repo StrivingRabbit/colorplay-next --verify-tag \
-            --title "ColorPlay Next ${VERSION}" --notes-file "$RUNNER_TEMP/official-notes.md" --draft --latest=false
-          # 全部附件上传完成后才公开，避免部分上传失败产生不完整的正式包。
-          gh api "repos/StrivingRabbit/colorplay-next/releases/tags/$TAG" > "$RUNNER_TEMP/official-draft.json"
-          python3 - <<'PY'
-          import hashlib, json, os
-          from pathlib import Path
-          release = json.loads(Path(os.environ['RUNNER_TEMP'], 'official-draft.json').read_text())
-          if not release['draft'] or release['prerelease']:
-              raise SystemExit('准备公开的 Release 不是预期正式草稿')
-          for name in (os.environ['NAME'], os.environ['NAME'] + '.sha256'):
-              assets = [a for a in release['assets'] if a['name'] == name]
-              if len(assets) != 1 or assets[0]['state'] != 'uploaded' or assets[0]['size'] != Path(name).stat().st_size:
-                  raise SystemExit('草稿附件缺失、不完整或大小不符，禁止公开')
-              digest = assets[0].get('digest')
-              if digest and digest != 'sha256:' + hashlib.sha256(Path(name).read_bytes()).hexdigest():
-                  raise SystemExit('草稿附件摘要与本地验证产物不同，禁止公开')
-          PY
-          # Drafts are not available through GET /releases/tags/{tag}.
-          # Resolve their numeric ID from the authenticated list, then PATCH by ID.
-          python3 tools/publish-official-release.py --tag "$TAG" --candidate "$CANDIDATE"
+          # 幂等：按数值 ID 复用/创建草稿、补齐附件后公开。草稿在发布前没有真正的
+          # git tag（被 GitHub 挂在 untagged-… 下），不能用 GET /releases/tags/{tag} 回读。
+          python3 tools/publish-official-release.py --tag "$TAG" --candidate "$CANDIDATE" \
+            --title "ColorPlay Next ${VERSION}" \
+            --notes-file "$RUNNER_TEMP/official-notes.md" \
+            --asset "$NAME" --asset "$NAME.sha256"
           ARGS=(--finalize)
           if [ -n "$REQUESTED_TAG" ]; then ARGS+=(--tag "$REQUESTED_TAG"); fi
           if [ "$ALLOW_BACKFILL" = true ]; then ARGS+=(--allow-backfill); fi

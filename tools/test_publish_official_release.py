@@ -100,6 +100,41 @@ class PublishTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     publisher.publish(TAG, SHA)
 
+    def test_creates_draft_when_missing_then_publishes(self):
+        draft = release()
+        with patch.object(publisher, 'validate_git_context', return_value=(RECORD, prepare)), \
+                patch.object(publisher, 'validate_remote_tag'), \
+                patch.object(publisher, 'find_release', side_effect=[None, draft, draft]) as find, \
+                patch.object(publisher, 'create_draft') as create, \
+                patch.object(publisher, 'ensure_assets') as upload, \
+                patch.object(publisher, 'api', return_value=dict(draft, draft=False)) as api:
+            publisher.publish(TAG, SHA, title='T', notes_file='n', assets=('a.apk', 'a.sha256'))
+            create.assert_called_once_with(TAG, 'T', 'n', ('a.apk', 'a.sha256'))
+            upload.assert_called_once_with(TAG, draft, ('a.apk', 'a.sha256'))
+            self.assertEqual(find.call_count, 3)
+            api.assert_called_once()
+
+    def test_existing_draft_reused_without_create(self):
+        draft = release()
+        with patch.object(publisher, 'validate_git_context', return_value=(RECORD, prepare)), \
+                patch.object(publisher, 'validate_remote_tag'), \
+                patch.object(publisher, 'find_release', side_effect=[draft, draft]) as find, \
+                patch.object(publisher, 'create_draft') as create, \
+                patch.object(publisher, 'ensure_assets') as upload, \
+                patch.object(publisher, 'api', return_value=dict(draft, draft=False)) as api:
+            publisher.publish(TAG, SHA, title='T', notes_file='n', assets=('a.apk', 'a.sha256'))
+            create.assert_not_called()
+            upload.assert_called_once()
+            self.assertEqual(find.call_count, 2)
+            api.assert_called_once()
+
+    def test_missing_asset_is_reuploaded(self):
+        bare = release()
+        bare['assets'] = []
+        with patch.object(publisher.subprocess, 'check_call') as call:
+            publisher.ensure_assets(TAG, bare, ('x.apk', 'x.sha256'))
+            self.assertEqual(call.call_count, 2)
+
     def test_valid_normal_and_recovery_contexts(self):
         for recovery in (False, True):
             outputs = [SHA, '', '.github/workflows/fix.yml\ntools/fix.py\nREADME.md\nAGENTS.md'] if recovery else [SHA, SHA]
