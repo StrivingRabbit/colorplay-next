@@ -79,7 +79,7 @@ jobs:
           export ALPHA_RETRY_UNPUBLISHED
           # 只运行本仓库 main 中维护的准备脚本，不运行任意 fork 的脚本。
           git show origin/main:tools/prepare-alpha.py > "$RUNNER_TEMP/prepare-alpha.py"
-          python3 "$RUNNER_TEMP/prepare-alpha.py"
+          python3 "$RUNNER_TEMP/prepare-alpha.py" 2>&1 | tee "$RUNNER_TEMP/alpha-prepare.log"
 
       - name: 无更新时记录摘要
         if: steps.prepare.outputs.changed == 'false'
@@ -278,6 +278,7 @@ jobs:
             app/build/reports/tests/**
             app/build/test-results/**
             app/build/reports/lint-results-release*
+            ${{ runner.temp }}/alpha-prepare.log
             ${{ runner.temp }}/alpha-rust-test.log
             ${{ runner.temp }}/alpha-gradle.log
           if-no-files-found: ignore
