@@ -152,7 +152,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import base64, os
+          import base64, hashlib, os, subprocess
           from pathlib import Path
           required = ('KEYSTORE_BASE64', 'KEYSTORE_PASSWORD', 'KEY_ALIAS', 'KEY_PASSWORD')
           missing = [key for key in required if not os.environ.get(key)]
@@ -166,6 +166,14 @@ jobs:
               + 'storePassword=' + escape(os.environ['KEYSTORE_PASSWORD']) + '\n'
               + 'keyAlias=' + escape(os.environ['KEY_ALIAS']) + '\n'
               + 'keyPassword=' + escape(os.environ['KEY_PASSWORD']) + '\n')
+          # 公钥证书可公开；不输出私钥、密码或整个 keystore。
+          certificate = subprocess.check_output(['keytool', '-exportcert', '-keystore', 'release.jks',
+              '-storepass:env', 'KEYSTORE_PASSWORD', '-alias', os.environ['KEY_ALIAS']])
+          fingerprint = hashlib.sha256(certificate).hexdigest()
+          expected = 'e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66'
+          print('Keystore certificate SHA-256:', fingerprint)
+          if fingerprint != expected:
+              raise SystemExit('Secrets 中的 keystore/alias 不对应既有正式证书；禁止构建。期望=' + expected + ' 实际=' + fingerprint)
           PY
 
       - name: 构建 APK、Android 单测与 Release Lint
@@ -198,9 +206,16 @@ jobs:
           from pathlib import Path
           certs = Path(os.environ['RUNNER_TEMP'], 'alpha-certs.txt').read_text()
           expected = 'e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66'
-          actual = re.findall(r'^Signer #\d+ certificate SHA-256 digest: (\S+)$', certs, re.M)
-          if 'CN=Android Debug' in certs or len(actual) != 1 or actual[0].lower() != expected:
-              raise SystemExit('APK 正式签名证书不匹配，禁止推送与发布')
+          # splitlines 消除 Java/SDK 输出行尾差异；严格验证实际签名证书而非模糊搜索。
+          actual = [m.group(1).lower() for line in certs.splitlines()
+                    if (m := re.fullmatch(r'Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]{64})', line.strip()))]
+          print('APK signer fingerprints:', actual)
+          print('Expected certificate SHA-256:', expected)
+          if not actual:
+              print('apksigner public certificate output:\n' + certs)
+              raise SystemExit('无法解析 apksigner 的证书指纹，禁止推送与发布（不是已确认签名不同）')
+          if 'CN=Android Debug' in certs or len(actual) != 1 or actual[0] != expected:
+              raise SystemExit('APK 正式签名证书不匹配，禁止推送与发布。实际=' + repr(actual))
           with zipfile.ZipFile('app/build/outputs/apk/release/app-release.apk') as apk:
               if 'lib/arm64-v8a/libhypercar_core.so' not in apk.namelist():
                   raise SystemExit('APK 缺少 Rust 核心层')
@@ -278,6 +293,7 @@ jobs:
             app/build/reports/tests/**
             app/build/test-results/**
             app/build/reports/lint-results-release*
+            ${{ runner.temp }}/alpha-certs.txt
             ${{ runner.temp }}/alpha-prepare.log
             ${{ runner.temp }}/alpha-rust-test.log
             ${{ runner.temp }}/alpha-gradle.log
