@@ -192,6 +192,7 @@ jobs:
           UPSTREAM: ${{ steps.prepare.outputs.upstream }}
         run: |
           set -euo pipefail
+          python3 tools/test_alpha_signing.py
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]
           [[ "$CODE" =~ ^[0-9]+$ ]]
           [[ "$UPSTREAM" =~ ^[0-9a-f]{40}$ ]]
@@ -208,7 +209,7 @@ jobs:
           expected = 'e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66'
           # splitlines 消除 Java/SDK 输出行尾差异；严格验证实际签名证书而非模糊搜索。
           actual = [m.group(1).lower() for line in certs.splitlines()
-                    if (m := re.fullmatch(r'Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]{64})', line.strip()))]
+                    if (m := re.fullmatch(r'(?:Signer #\d+ certificate|V2 Signer: certificate) SHA-256 digest:\s*([0-9a-fA-F]{64})', line.strip()))]
           print('APK signer fingerprints:', actual)
           print('Expected certificate SHA-256:', expected)
           if not actual:
