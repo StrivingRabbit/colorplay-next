@@ -42,6 +42,7 @@ on:
 # 发布 Release 需要写权限（创建 tag / Release）
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: publish-colorplay-next
@@ -373,11 +374,11 @@ jobs:
 
           ### 本次修正
 
-          - 已配对车机 Wi-Fi 后出现时及时恢复绑定与 ctrl 广播，修复提前手动连接后需等待整轮 5 分钟的问题。
-          - 新增蓝牙回连唤醒：网络、广播和监听就绪 5 秒仍无会话时，尝试一次最多 30 秒经典可发现窗口，独立守护进程负责到期及提前清理。
-          - 点击目标车机即可申请增强发现授权，批准后显示标签；统一授权结果出口，避免重复弹窗、提示及日志。
-          - 蓝牙监听失败/重启后自动重新注册；补齐手动会话的音频 profile 策略及旧任务清理。
-          - 本地 88 项单元测试通过，可发现窗口的到期与提前恢复已在 HyperOS 实机验证；车机二次上车效果仍待实车复测。
+          - 关于页新增可持久保存的“接收 Alpha 测试版更新”开关；不会自动安装，关闭不会降级。
+          - 双主题玻璃卡片、底栏增强边缘折射与透光，主题切换时重新绑定采样源和绘制节点。
+          - Switch、Button、Card 沿用公共玻璃组件，README 增加双主题与更新渠道实拍截图。
+          - Rust 辅助音频状态机测试显式注入仅测试用编码器，生产 AAC 编码路径不变。
+          - 模拟器曾出现渲染线程等待 GPU 图层上传导致的无响应，尚未确认根治；一加16与实车完整闭环仍待验证。
 
           ### 使用要求与适配状态
 
@@ -416,6 +417,37 @@ jobs:
               --latest
           fi
           gh release view "$TAG" --repo "$REPO" --json url --jq .url >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: 正式版发布成功后同步并启动 Alpha
+        if: steps.meta.outputs.publish == 'true' && github.ref == 'refs/heads/main' && steps.version.outputs.name == '0.2.12'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.name }}
+        run: |
+          set -euo pipefail
+          # 用户授权顺序：正式版真实可下载后，才同步 Alpha。任何一步失败立即停止。
+          gh api "repos/$REPO/releases/tags/$TAG" > "$RUNNER_TEMP/stable-release.json"
+          python3 - <<'PYVERIFY'
+          import json, os
+          from pathlib import Path
+          release = json.loads(Path(os.environ['RUNNER_TEMP'], 'stable-release.json').read_text())
+          assert release['tag_name'] == os.environ['TAG']
+          assert not release['draft'] and not release['prerelease']
+          assert release['name'] == 'ColorPlay Next ' + os.environ['VERSION']
+          assert any(a['name'].endswith('.apk') and a['state'] == 'uploaded' for a in release['assets'])
+          PYVERIFY
+          git fetch origin main alpha --unshallow || git fetch origin main alpha
+          # 必须仍是本次发布的 main，不能把后来未发布的代码同步到 Alpha。
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -B alpha origin/alpha
+          git merge --no-edit "$GITHUB_SHA"
+          git push origin HEAD:refs/heads/alpha
+          gh workflow run alpha-upstream.yml --repo "$REPO" --ref main
+          echo '正式版已发布；随后同步 alpha 并触发独立测试/预发布工作流。' >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传测试报告（失败时便于定位）
         if: failure()
