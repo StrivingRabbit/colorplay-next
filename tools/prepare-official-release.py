@@ -205,15 +205,18 @@ def main():
         if record['release_id'] == rid:
             if record['upstream'] != target:
                 raise RuntimeError('上游 tag 已移动，禁止复用已记录 Release')
-            # 只允许重试原候选 HEAD，禁止把后续 main 改动打入已有版本。
-            if git('log', '-1', '--format=%H', '--', PROVENANCE) != original:
-                raise RuntimeError('main 已前进，需人工恢复未完成的正式发布')
+            # 候选以已推 tag 指向的提交为准；HEAD 只允许在其上叠加元数据（CI/文档）提交，
+            # 源码或版本一旦变化即禁止复用旧候选。
             version = record['version']
             code = record['code']
+            candidate_commit = git('rev-parse', f'refs/tags/v{version}^{{commit}}')
+            changed = git('diff', '--name-only', '--no-renames', candidate_commit + '..HEAD').splitlines()
+            if any(not (p.startswith('.github/') or p.startswith('tools/') or p in ('README.md', 'AGENTS.md')) for p in changed):
+                raise RuntimeError('候选之后 main 出现了源码或版本变化，需人工恢复未完成的正式发布')
             if any(r['tag_name'] == 'v' + version for r in existing):
                 own = next(r for r in existing if r['tag_name'] == 'v' + version)
                 validate_published(own, version)
-                if git('rev-parse', f'refs/tags/v{version}^{{commit}}') != original:
+                if git('rev-parse', f'refs/tags/v{version}^{{commit}}') != candidate_commit:
                     raise RuntimeError('已有 tag 与 main 候选不一致')
                 state['completed'].append(rid)
                 save_state(state, old_state)

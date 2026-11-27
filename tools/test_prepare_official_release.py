@@ -186,6 +186,8 @@ class RepositoryTest(unittest.TestCase):
         self.initialize()
         self.invoke([release(1), release(2)])
         candidate = self.git('rev-parse', 'HEAD')
+        # 模拟上次失败运行的发布步骤已推送 tag；重试以 tag 指向的候选为准。
+        self.git('tag', 'v0.2.13', candidate)
         self.git('push', 'origin', 'main')
         self.output.write_text('')
         self.invoke([release(1), release(2)])
@@ -194,7 +196,7 @@ class RepositoryTest(unittest.TestCase):
         (self.root / 'later.txt').write_text('later main')
         self.commit('later main')
         self.git('push', 'origin', 'main')
-        with self.assertRaisesRegex(RuntimeError, 'main 已前进'):
+        with self.assertRaisesRegex(RuntimeError, '源码或版本变化'):
             self.invoke([release(1), release(2)])
 
     def test_published_retry_only_advances_cursor_and_is_idempotent(self):
@@ -220,6 +222,7 @@ class RepositoryTest(unittest.TestCase):
         self.invoke([release(1), release(2)])
         self.invoke([release(1), release(2)], args=['--tag', 'v1.0.2', '--allow-backfill'])
         candidate = self.git('rev-parse', 'HEAD')
+        self.git('tag', 'v0.2.13', candidate)
         self.git('push', 'origin', 'main')
         earlier = release(3)
         earlier['published_at'] = '2020-01-01T00:00:00Z'

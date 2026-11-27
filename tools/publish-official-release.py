@@ -42,13 +42,12 @@ def validate_git_context(tag, candidate, recovery=False):
         raise ValueError('必须指定正式版本 tag')
     if git('rev-parse', f'refs/tags/{tag}^{{commit}}') != candidate:
         raise RuntimeError('tag 未指向指定候选，禁止发布')
-    if recovery:
-        git('merge-base', '--is-ancestor', candidate, 'HEAD')
-        changed = git('diff', '--name-only', '--no-renames', candidate + '..HEAD').splitlines()
-        if any(not (p.startswith('.github/') or p.startswith('tools/') or p in ('README.md', 'AGENTS.md')) for p in changed):
-            raise RuntimeError('恢复期间 App 源码或版本等非允许路径发生变化')
-    elif git('rev-parse', 'HEAD') != candidate:
-        raise RuntimeError('普通发布必须在候选 HEAD 上执行')
+    # 候选必须是 HEAD 的祖先，且两者之间只允许元数据（CI/文档）变化；
+    # 候选即 HEAD 是「空 diff」的退化情形。源码或版本变化一律拒绝。
+    git('merge-base', '--is-ancestor', candidate, 'HEAD')
+    changed = git('diff', '--name-only', '--no-renames', candidate + '..HEAD').splitlines()
+    if any(not (p.startswith('.github/') or p.startswith('tools/') or p in ('README.md', 'AGENTS.md')) for p in changed):
+        raise RuntimeError('候选与 HEAD 之间出现源码或版本等非允许路径变化，禁止发布')
     record = json.loads(git('show', candidate + ':.github/official-release.json'))
     spec = importlib.util.spec_from_file_location('official_prepare', ROOT / 'tools/prepare-official-release.py')
     prepare = importlib.util.module_from_spec(spec)

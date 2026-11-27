@@ -135,23 +135,23 @@ class PublishTests(unittest.TestCase):
             publisher.ensure_assets(TAG, bare, ('x.apk', 'x.sha256'))
             self.assertEqual(call.call_count, 2)
 
-    def test_valid_normal_and_recovery_contexts(self):
-        for recovery in (False, True):
-            outputs = [SHA, '', '.github/workflows/fix.yml\ntools/fix.py\nREADME.md\nAGENTS.md'] if recovery else [SHA, SHA]
-            outputs += [json.dumps(RECORD), 'versionName=0.2.13\nversionCode=214\n']
-            with self.subTest(recovery=recovery), patch.object(publisher, 'git', side_effect=outputs):
-                record, module = publisher.validate_git_context(TAG, SHA, recovery)
+    def test_clean_and_metadata_ahead_contexts(self):
+        clean = [SHA, '', '', json.dumps(RECORD), 'versionName=0.2.13\nversionCode=214\n']
+        ahead = [SHA, '', '.github/workflows/fix.yml\ntools/fix.py\nREADME.md\nAGENTS.md', json.dumps(RECORD), 'versionName=0.2.13\nversionCode=214\n']
+        for outputs in (clean, ahead):
+            with self.subTest(outputs=outputs), patch.object(publisher, 'git', side_effect=outputs):
+                record, module = publisher.validate_git_context(TAG, SHA)
                 self.assertEqual(record, RECORD)
                 self.assertTrue(callable(module.validate_published))
 
     def test_version_code_mismatch_rejected(self):
-        with patch.object(publisher, 'git', side_effect=[SHA, SHA, json.dumps(RECORD), 'versionName=0.2.13\nversionCode=215\n']):
+        with patch.object(publisher, 'git', side_effect=[SHA, '', '', json.dumps(RECORD), 'versionName=0.2.13\nversionCode=215\n']):
             with self.assertRaisesRegex(RuntimeError, '版本身份'):
                 publisher.validate_git_context(TAG, SHA)
 
-    def test_normal_head_mismatch_rejected(self):
-        with patch.object(publisher, 'git', side_effect=[SHA, 'b' * 40]):
-            with self.assertRaisesRegex(RuntimeError, 'HEAD'):
+    def test_app_source_ahead_rejected(self):
+        with patch.object(publisher, 'git', side_effect=[SHA, '', 'app/src/main/Test.kt']):
+            with self.assertRaisesRegex(RuntimeError, '非允许路径'):
                 publisher.validate_git_context(TAG, SHA)
 
     def test_tag_mismatch_rejected(self):
@@ -159,11 +159,11 @@ class PublishTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'tag'):
                 publisher.validate_git_context(TAG, SHA)
 
-    def test_recovery_source_and_version_changes_rejected(self):
+    def test_source_and_version_changes_rejected(self):
         for path in ('app/src/main/Test.kt', 'version.properties', 'rust-core/src/lib.rs'):
             with self.subTest(path=path), patch.object(publisher, 'git', side_effect=[SHA, '', path]):
                 with self.assertRaisesRegex(RuntimeError, '非允许路径'):
-                    publisher.validate_git_context(TAG, SHA, True)
+                    publisher.validate_git_context(TAG, SHA)
 
     def test_recovery_validates_run_before_release_lookup(self):
         with patch.object(publisher, 'validate_git_context', return_value=(RECORD, prepare)), patch.object(publisher, 'validate_prior_run', side_effect=RuntimeError('门禁失败')) as check, patch.object(publisher, 'api') as api:

@@ -257,15 +257,14 @@ jobs:
         run: |
           set -euo pipefail
           TAG="v${VERSION}"
-          CANDIDATE=$(git rev-parse HEAD)
-          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$BASE"
-          git merge-base --is-ancestor "$BASE" "$CANDIDATE"
-          EXISTING=$(git ls-remote origin "refs/tags/$TAG" | cut -f1)
-          if [ -n "$EXISTING" ]; then
-            test "$EXISTING" = "$CANDIDATE"
-          else
-            git tag "$TAG" "$CANDIDATE"
+          # 候选以 tag 为准：恢复时已推 tag 指向旧候选，HEAD 仅允许叠加元数据提交；
+          # 新发布则在当前 HEAD 建 tag。
+          if [ -z "$(git ls-remote origin "refs/tags/$TAG" | cut -f1)" ]; then
+            git tag "$TAG" "$(git rev-parse HEAD)"
           fi
+          CANDIDATE=$(git rev-parse "refs/tags/$TAG^{commit}")
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$BASE"
+          git merge-base --is-ancestor "$CANDIDATE" HEAD
           # CAS 同时保护人工更新；main 仅允许从准备时基线快进，绝不改写已有 tag。
           git push --atomic "--force-with-lease=refs/heads/main:$BASE" origin \
             HEAD:refs/heads/main "refs/tags/$TAG:refs/tags/$TAG"
