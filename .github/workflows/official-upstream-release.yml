@@ -64,38 +64,34 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git show origin/main:tools/prepare-official-release.py > "$RUNNER_TEMP/prepare-official-release.py"
           python3 tools/test_publish_official_release.py
-          # Narrow recovery for the already validated 0.2.13 candidate. No rebuild,
-          # tag replacement, or version increment; the helper verifies the original run.
-          RECOVER_0213=$(python3 - <<'PYRECOVER'
-          import base64, json, subprocess
-          from pathlib import Path
-          provenance = Path('.github/official-release.json')
-          record = json.loads(provenance.read_text()) if provenance.exists() else {}
-          if record.get('version') != '0.2.13' or record.get('release_id') != 460390326:
-              print('false')
-          else:
-              payload = json.loads(subprocess.check_output(['gh', 'api',
-                  'repos/StrivingRabbit/colorplay-next/contents/state.json?ref=official-release-state'], text=True))
-              state = json.loads(base64.b64decode(payload['content']))
-              print('false' if 460390326 in state['completed'] else 'true')
-          PYRECOVER
-          )
-          if [ "$RECOVER_0213" = true ]; then
-            python3 tools/publish-official-release.py --tag v0.2.13 \
-              --candidate 60ea9a2561825f0de0c5be6ab7890949aabf1a6c --validated-run 45978079839
-            git checkout --detach 60ea9a2561825f0de0c5be6ab7890949aabf1a6c
-            python3 "$RUNNER_TEMP/prepare-official-release.py" --finalize
-            echo 'changed=false' >> "$GITHUB_OUTPUT"
-            echo '已恢复经原流水线验证的 0.2.13 草稿并登记游标；未重建或改写标签。' >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+          python3 tools/test_prepare_official_release.py
           ARGS=()
           if [ -n "$REQUESTED_TAG" ]; then ARGS+=(--tag "$REQUESTED_TAG"); fi
           if [ "$ALLOW_BACKFILL" = true ]; then ARGS+=(--allow-backfill); fi
-          python3 "$RUNNER_TEMP/prepare-official-release.py" "${ARGS[@]}" 2>&1 | tee "$RUNNER_TEMP/official-prepare.log"
+          python3 "$RUNNER_TEMP/prepare-official-release.py" ${ARGS[@]+"${ARGS[@]}"} 2>&1 | tee "$RUNNER_TEMP/official-prepare.log"
+
+      - name: 恢复既有候选的完整正式草稿
+        if: steps.prepare.outputs.resume == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OFFICIAL_REPO_DIR: ${{ github.workspace }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          CANDIDATE: ${{ steps.prepare.outputs.candidate }}
+          VALIDATED_RUN: ${{ steps.prepare.outputs.validated_run }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          ALLOW_BACKFILL: ${{ inputs.allow_backfill }}
+        run: |
+          set -euo pipefail
+          python3 tools/publish-official-release.py --tag "v$VERSION" \
+            --candidate "$CANDIDATE" --validated-run "$VALIDATED_RUN"
+          ARGS=(--finalize)
+          if [ -n "$REQUESTED_TAG" ]; then ARGS+=(--tag "$REQUESTED_TAG"); fi
+          if [ "$ALLOW_BACKFILL" = true ]; then ARGS+=(--allow-backfill); fi
+          python3 "$RUNNER_TEMP/prepare-official-release.py" ${ARGS[@]+"${ARGS[@]}"}
+          echo '已按原运行完整门禁恢复既有草稿；未重建 APK、补传附件或修改 tag。' >> "$GITHUB_STEP_SUMMARY"
 
       - name: 无新正式 Release 时记录摘要
-        if: steps.prepare.outputs.changed == 'false'
+        if: steps.prepare.outputs.changed == 'false' && steps.prepare.outputs.resume != 'true'
         run: echo '首次仅保存当前已有正式 Release 基线；后续无新增时不构建、不更新 main、不发布。历史回补必须手动指定 tag 并勾选允许回补。' >> "$GITHUB_STEP_SUMMARY"
 
       - name: 安装 JDK 17
@@ -268,8 +264,8 @@ jobs:
           # CAS 同时保护人工更新；main 仅允许从准备时基线快进，绝不改写已有 tag。
           git push --atomic "--force-with-lease=refs/heads/main:$BASE" origin \
             HEAD:refs/heads/main "refs/tags/$TAG:refs/tags/$TAG"
-          # 幂等：按数值 ID 复用/创建草稿、补齐附件后公开。草稿在发布前没有真正的
-          # git tag（被 GitHub 挂在 untagged-… 下），不能用 GET /releases/tags/{tag} 回读。
+          # 仅新建时上传经字节校验的附件；已有草稿必须完整且匹配原门禁，禁止补传。
+          # 草稿通过分页列表定位并按数值 ID 公开，从不依赖 tags API 回读。
           python3 tools/publish-official-release.py --tag "$TAG" --candidate "$CANDIDATE" \
             --title "ColorPlay Next ${VERSION}" \
             --notes-file "$RUNNER_TEMP/official-notes.md" \
@@ -277,7 +273,7 @@ jobs:
           ARGS=(--finalize)
           if [ -n "$REQUESTED_TAG" ]; then ARGS+=(--tag "$REQUESTED_TAG"); fi
           if [ "$ALLOW_BACKFILL" = true ]; then ARGS+=(--allow-backfill); fi
-          python3 "$RUNNER_TEMP/prepare-official-release.py" "${ARGS[@]}"
+          python3 "$RUNNER_TEMP/prepare-official-release.py" ${ARGS[@]+"${ARGS[@]}"}
           cat "$RUNNER_TEMP/official-notes.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 失败摘要
@@ -286,7 +282,7 @@ jobs:
           {
             echo '### 官方 Release 跟随失败'
             echo '源码冲突、测试、Lint、构建、签名或 CAS 失败均禁止推送候选和发布。'
-            echo 'Git 推送与 GitHub Release API 不能跨服务原子提交。若推送后 Release API 失败，main/tag 可能已更新；游标不推进，下次仅允许复用同一候选重试，禁止重打 tag。若 main 再前进必须人工恢复。'
+            echo 'Git 推送与 GitHub Release API 不能跨服务原子提交。若推送后 Release API 失败，main/tag 可能已更新；游标不推进。后续仅在原门禁、候选、完整草稿及附件摘要一致时恢复，不重建、不补传、不重打 tag；main 只允许元数据前进，源码、版本或发布记录变化必须人工恢复。'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 保存失败报告

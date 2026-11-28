@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """安全发布 helper 的离线回归测试；所有 API 修改均为 mock。"""
 import copy
+import hashlib
+import tempfile
 import importlib.util
 import json
 from pathlib import Path
@@ -34,7 +36,9 @@ def release(draft=True):
             '- 正式签名证书 SHA-256：e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66')),
         'assets': [
             {'name': 'colorplay-next-0.2.13-release.apk', 'state': 'uploaded', 'size': 99, 'digest': 'sha256:' + 'c' * 64},
-            {'name': 'colorplay-next-0.2.13-release.apk.sha256', 'state': 'uploaded', 'size': 99}],
+            {'name': 'colorplay-next-0.2.13-release.apk.sha256', 'state': 'uploaded',
+             'size': len(('c' * 64 + '  colorplay-next-0.2.13-release.apk\n').encode()),
+             'digest': 'sha256:' + hashlib.sha256(('c' * 64 + '  colorplay-next-0.2.13-release.apk\n').encode()).hexdigest()}],
     }
 
 
@@ -43,6 +47,12 @@ class PublishTests(unittest.TestCase):
         remote = patch.object(publisher, 'validate_remote_tag')
         remote.start()
         self.addCleanup(remote.stop)
+        prior = patch.object(publisher, 'find_validated_run', return_value='123')
+        prior.start()
+        self.addCleanup(prior.stop)
+        alpha = patch.object(publisher, 'validate_alpha_version')
+        alpha.start()
+        self.addCleanup(alpha.stop)
 
     def publish_with(self, value):
         def api(path, payload=None, paginate=False):
@@ -106,12 +116,13 @@ class PublishTests(unittest.TestCase):
                 patch.object(publisher, 'validate_remote_tag'), \
                 patch.object(publisher, 'find_release', side_effect=[None, draft, draft]) as find, \
                 patch.object(publisher, 'create_draft') as create, \
+                patch.object(publisher, 'validate_local_assets', return_value=draft), \
                 patch.object(publisher, 'ensure_assets') as upload, \
                 patch.object(publisher, 'api', return_value=dict(draft, draft=False)) as api:
             publisher.publish(TAG, SHA, title='T', notes_file='n', assets=('a.apk', 'a.sha256'))
             create.assert_called_once_with(TAG, 'T', 'n', ('a.apk', 'a.sha256'))
             upload.assert_called_once_with(TAG, draft, ('a.apk', 'a.sha256'))
-            self.assertEqual(find.call_count, 3)
+            self.assertEqual(find.call_count, 2)
             api.assert_called_once()
 
     def test_existing_draft_reused_without_create(self):
@@ -120,20 +131,67 @@ class PublishTests(unittest.TestCase):
                 patch.object(publisher, 'validate_remote_tag'), \
                 patch.object(publisher, 'find_release', side_effect=[draft, draft]) as find, \
                 patch.object(publisher, 'create_draft') as create, \
+                patch.object(publisher, 'validate_local_assets', return_value=draft), \
                 patch.object(publisher, 'ensure_assets') as upload, \
                 patch.object(publisher, 'api', return_value=dict(draft, draft=False)) as api:
             publisher.publish(TAG, SHA, title='T', notes_file='n', assets=('a.apk', 'a.sha256'))
             create.assert_not_called()
             upload.assert_called_once()
-            self.assertEqual(find.call_count, 2)
+            self.assertEqual(find.call_count, 1)
             api.assert_called_once()
 
-    def test_missing_asset_is_reuploaded(self):
+    def test_missing_asset_is_not_reuploaded(self):
         bare = release()
         bare['assets'] = []
-        with patch.object(publisher.subprocess, 'check_call') as call:
-            publisher.ensure_assets(TAG, bare, ('x.apk', 'x.sha256'))
-            self.assertEqual(call.call_count, 2)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'x.apk'
+            path.write_bytes(b'APK')
+            with patch.object(publisher.subprocess, 'check_call') as call:
+                with self.assertRaisesRegex(RuntimeError, '禁止补传'):
+                    publisher.ensure_assets(TAG, bare, (str(path),))
+                call.assert_not_called()
+
+    def test_checksum_asset_digest_and_size_are_required(self):
+        for key, value in (('digest', None), ('digest', 'sha256:' + 'd' * 64), ('size', 1), ('state', 'new')):
+            item = release()
+            item['assets'][1][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(RuntimeError):
+                publisher.validate_release(item, TAG, SHA, RECORD, prepare)
+
+    def test_local_bytes_are_verified_before_any_api_mutation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            apk = Path(temp) / 'colorplay-next-0.2.13-release.apk'
+            apk.write_bytes(b'APK')
+            checksum = Path(str(apk) + '.sha256')
+            checksum.write_text('incorrect checksum')
+            notes = Path(temp) / 'notes'
+            notes.write_text('- APK SHA-256：' + 'c' * 64)
+            with patch.object(publisher, 'validate_git_context', return_value=(RECORD, prepare)), patch.object(publisher, 'api') as api:
+                with self.assertRaisesRegex(RuntimeError, '字节不符'):
+                    publisher.publish(TAG, SHA, title='T', notes_file=str(notes), assets=(str(apk), str(checksum)))
+                api.assert_not_called()
+
+    def test_local_identity_and_bytes_guard_creation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            apk = Path(temp) / 'colorplay-next-0.2.13-release.apk'
+            apk.write_bytes(b'APK')
+            digest = hashlib.sha256(b'APK').hexdigest()
+            checksum = Path(str(apk) + '.sha256')
+            checksum.write_text(f'{digest}  {apk.name}\n')
+            notes = Path(temp) / 'notes'
+            notes.write_text(release()['body'].replace('c' * 64, digest))
+            assets = (str(apk), str(checksum))
+            local = publisher.validate_local_assets(TAG, str(notes), assets)
+            publisher.validate_release(local, TAG, SHA, RECORD, prepare)
+            publisher.ensure_assets(TAG, local, assets)
+            for altered in (notes.read_text().replace(SHA, 'd' * 40),
+                            notes.read_text().replace('versionCode：214', 'versionCode：215')):
+                notes.write_text(altered)
+                with patch.object(publisher, 'validate_git_context', return_value=(RECORD, prepare)), patch.object(publisher, 'api') as api, patch.object(publisher, 'create_draft') as create:
+                    with self.assertRaisesRegex(RuntimeError, '版本、候选或签名'):
+                        publisher.publish(TAG, SHA, title='T', notes_file=str(notes), assets=assets)
+                    api.assert_not_called()
+                    create.assert_not_called()
 
     def test_clean_and_metadata_ahead_contexts(self):
         clean = [SHA, '', '', json.dumps(RECORD), 'versionName=0.2.13\nversionCode=214\n']
@@ -160,7 +218,7 @@ class PublishTests(unittest.TestCase):
                 publisher.validate_git_context(TAG, SHA)
 
     def test_source_and_version_changes_rejected(self):
-        for path in ('app/src/main/Test.kt', 'version.properties', 'rust-core/src/lib.rs'):
+        for path in ('app/src/main/Test.kt', 'version.properties', 'rust-core/src/lib.rs', '.github/official-release.json'):
             with self.subTest(path=path), patch.object(publisher, 'git', side_effect=[SHA, '', path]):
                 with self.assertRaisesRegex(RuntimeError, '非允许路径'):
                     publisher.validate_git_context(TAG, SHA)

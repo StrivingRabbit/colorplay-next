@@ -1,6 +1,10 @@
 import importlib.util
+import hashlib
 import json
 import os
+import re
+import shutil
+import textwrap
 from pathlib import Path
 import subprocess
 import sys
@@ -103,6 +107,9 @@ class RepositoryTest(unittest.TestCase):
             (self.root / folder).mkdir(parents=True, exist_ok=True)
         for file in ('.github/trusted', 'tools/trusted', 'AGENTS.md'):
             (self.root / file).write_text('fork owned')
+        for name in ('prepare-official-release.py', 'publish-official-release.py'):
+            (self.root / 'tools' / name).write_bytes(Path(__file__).with_name(name).read_bytes())
+        (self.root / '.gitignore').write_text('__pycache__/\n')
         (self.root / 'business.txt').write_text('base\n')
         (self.root / 'version.properties').write_text('versionName=0.1.0\nversionCode=100\n')
         (self.root / module.META).write_text('const val VERSION = "0.1.0"\nconst val CODE = 100\nconst val COMMIT = "' + '0' * 40 + '"\n')
@@ -130,7 +137,7 @@ class RepositoryTest(unittest.TestCase):
         self.patch_root.start()
         self.addCleanup(self.patch_root.stop)
         self.output = self.root / '.git/output'
-        self.env = patch.dict(os.environ, {'GITHUB_OUTPUT': str(self.output)})
+        self.env = patch.dict(os.environ, {'GITHUB_OUTPUT': str(self.output), 'OFFICIAL_REPO_DIR': str(self.root)})
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -199,17 +206,46 @@ class RepositoryTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '源码或版本变化'):
             self.invoke([release(1), release(2)])
 
+    def complete_release(self, draft=False):
+        record = json.loads((self.root / module.PROVENANCE).read_text())
+        candidate = self.git('rev-parse', 'refs/tags/v0.2.13^{commit}')
+        checksum = ('a' * 64 + '  colorplay-next-0.2.13-release.apk\n').encode()
+        value = release(10, 'v0.2.13')
+        value.update(draft=draft, body='\n'.join((
+            '### ColorPlay Next 0.2.13（正式版）', '- versionCode：213',
+            '- 上游官方 Release 精确提交：fw867/hypercar @ ' + record['upstream'],
+            '- 本仓库候选提交：' + candidate, '- APK SHA-256：' + 'a' * 64,
+            '- 正式签名证书 SHA-256：e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66')),
+            assets=[{'name': 'colorplay-next-0.2.13-release.apk', 'size': 123, 'state': 'uploaded', 'digest': 'sha256:' + 'a' * 64},
+                    {'name': 'colorplay-next-0.2.13-release.apk.sha256', 'size': len(checksum), 'state': 'uploaded',
+                     'digest': 'sha256:' + hashlib.sha256(checksum).hexdigest()}])
+        return value
+
+    def test_pending_provenance_change_is_not_metadata(self):
+        self.initialize()
+        self.invoke([release(1), release(2)])
+        self.git('tag', 'v0.2.13')
+        record = json.loads((self.root / module.PROVENANCE).read_text())
+        record['subject'] = 'changed release identity'
+        (self.root / module.PROVENANCE).write_text(json.dumps(record))
+        self.commit('alter provenance')
+        self.git('push', 'origin', 'main')
+        with self.assertRaisesRegex(RuntimeError, '源码或版本变化'):
+            self.invoke([release(1), release(2)])
+        state_sha = self.git('ls-remote', 'origin', module.STATE_REF).split()[0]
+        self.assertEqual([], json.loads(self.git('show', state_sha + ':state.json'))['completed'])
+
     def test_published_retry_only_advances_cursor_and_is_idempotent(self):
         self.initialize()
         self.invoke([release(1), release(2)])
         self.git('push', 'origin', 'main')
         self.git('tag', 'v0.2.13')
-        own = [release(10, 'v0.2.13')]
-        with self.assertRaisesRegex(RuntimeError, '缺失附件'):
+        self.git('push', 'origin', 'v0.2.13')
+        own = [self.complete_release()]
+        saved = own[0].pop('assets')
+        with self.assertRaisesRegex(RuntimeError, '附件缺失'):
             self.invoke([release(1), release(2)], own)
-        own[0]['body'] = '- APK SHA-256：' + 'a' * 64
-        own[0]['assets'] = [{'name': 'colorplay-next-0.2.13-release.apk', 'size': 123, 'state': 'uploaded', 'digest': 'sha256:' + 'a' * 64},
-                            {'name': 'colorplay-next-0.2.13-release.apk.sha256', 'size': 123, 'state': 'uploaded'}]
+        own[0]['assets'] = saved
         self.output.write_text('')
         self.invoke([release(1), release(2)], own)
         self.assertIn('changed=false', self.output.read_text())
@@ -230,6 +266,134 @@ class RepositoryTest(unittest.TestCase):
         self.assertEqual(candidate, self.git('rev-parse', 'HEAD'))
         record = json.loads((self.root / module.PROVENANCE).read_text())
         self.assertEqual(2, record['release_id'])
+
+    def test_workflow_shell_preflight_prepare_resume_and_finalize(self):
+        self.initialize()
+        self.invoke([release(1), release(2)])
+        candidate = self.git('rev-parse', 'HEAD')
+        self.git('tag', 'v0.2.13')
+        self.git('push', 'origin', 'main', 'v0.2.13')
+        (self.root / 'tools/trusted').write_text('metadata repair')
+        self.commit('metadata repair')
+        self.git('push', 'origin', 'main')
+        helper = module.publisher_module()
+        fixture = Path(self.temp.name) / 'api.json'
+        value = self.complete_release(draft=True)
+        run = {'id': 123, 'path': helper.WORKFLOW, 'head_sha': self.original,
+               'event': 'schedule', 'head_branch': 'main', 'status': 'completed',
+               'repository': {'full_name': module.REPO}, 'head_repository': {'full_name': module.REPO}}
+        job = {'name': 'official', 'status': 'completed',
+               'steps': [{'name': name, 'conclusion': 'success'} for name in helper.REQUIRED_STEPS]}
+        fixture.write_text(json.dumps({'release': value, 'run': run, 'job': job,
+                                       'upstream': [release(1), release(2)]}))
+        bindir = Path(self.temp.name) / 'bin'
+        bindir.mkdir()
+        real_git = shutil.which('git')
+        fake_git = bindir / 'git'
+        fake_git.write_text('#!' + sys.executable + '\n' + textwrap.dedent('''\
+            import os, subprocess, sys
+            args = sys.argv[1:]
+            offset = 2 if args[:1] == ['-C'] else 0
+            command = args[offset:]
+            if command[:2] == ['ls-remote', 'upstream']:
+                print(os.environ['TEST_UPSTREAM_REFS'])
+                sys.exit(0)
+            if command[:3] == ['fetch', '--no-tags', 'upstream']:
+                args[offset + 2] = os.environ['TEST_ROOT']
+            os.execv(os.environ['TEST_REAL_GIT'], [os.environ['TEST_REAL_GIT'], *args])
+            '''))
+        fake_git.chmod(0o755)
+        fake_gh = bindir / 'gh'
+        fake_gh.write_text('#!' + sys.executable + '\n' + textwrap.dedent('''\
+            import json, os, sys
+            from pathlib import Path
+            file = Path(os.environ['TEST_API'])
+            data = json.loads(file.read_text())
+            args = sys.argv[1:]
+            if args[0] != 'api':
+                raise SystemExit('禁止创建、上传或通过 tag 读取草稿')
+            path = next(a for a in args[1:] if a.startswith('repos/'))
+            with open(os.environ['TEST_CALLS'], 'a') as calls:
+                calls.write(path + '\\n')
+            if '/releases/tags/' in path:
+                raise SystemExit('禁止 tags API')
+            if path.endswith('/releases/10') and '--method' in args:
+                payload = json.load(sys.stdin)
+                assert payload == {'draft': False, 'prerelease': False, 'make_latest': 'true'}
+                data['release']['draft'] = False
+                file.write_text(json.dumps(data))
+                answer = data['release']
+            elif path.startswith('repos/fw867/hypercar/releases?'):
+                answer = [data['upstream']]
+            elif '/releases?' in path:
+                answer = [[data['release']]]
+            elif '/actions/workflows/' in path:
+                answer = [{'workflow_runs': [data['run']]}]
+            elif path.endswith('/actions/runs/123'):
+                answer = data['run']
+            elif '/actions/runs/123/jobs?' in path:
+                answer = [{'jobs': [data['job']]}]
+            else:
+                raise SystemExit('未允许的 API：' + path)
+            print(json.dumps(answer))
+            '''))
+        fake_gh.chmod(0o755)
+        workflow = Path(__file__).resolve().parents[1] / '.github/workflows/official-upstream-release.yml'
+        source = workflow.read_text()
+        def shell_step(name):
+            block = source.split('      - name: ' + name + '\n', 1)[1].split('\n      - name:', 1)[0]
+            return textwrap.dedent(block.split('        run: |\n', 1)[1])
+        preflight = shell_step('准备正式候选或初始化游标')
+        # 本测试运行在被测测试文件内，跳过仅负责启动同一套测试的两行，保留完整生产预检与命令链。
+        preflight = preflight.replace('python3 tools/test_publish_official_release.py', ':').replace('python3 tools/test_prepare_official_release.py', ':')
+        resume = shell_step('恢复既有候选的完整正式草稿')
+        self.git('remote', 'remove', 'upstream')
+        self.output.write_text('')
+        calls = Path(self.temp.name) / 'calls'
+        runner = Path(self.temp.name) / 'runner'
+        runner.mkdir()
+        env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ['PATH'],
+                   TEST_ROOT=str(self.root), TEST_REAL_GIT=real_git, TEST_API=str(fixture), TEST_CALLS=str(calls),
+                   TEST_UPSTREAM_REFS=f'{self.base}\\trefs/tags/v1.0.1\n{self.target}\\trefs/tags/v1.0.2'.replace('\\t', '\t'),
+                   REQUESTED_TAG='', ALLOW_BACKFILL='false', RUNNER_TEMP=str(runner),
+                   GITHUB_STEP_SUMMARY=str(runner / 'summary'))
+        original_fixture = fixture.read_text()
+        for fault in ('missing_asset', 'digest', 'gate', 'run_source'):
+            data = json.loads(original_fixture)
+            if fault == 'missing_asset':
+                data['release']['assets'].pop()
+            elif fault == 'digest':
+                data['release']['assets'][0]['digest'] = 'sha256:' + 'f' * 64
+            elif fault == 'gate':
+                data['job']['steps'][1]['conclusion'] = 'skipped'
+            else:
+                data['run']['head_sha'] = 'f' * 40
+            fixture.write_text(json.dumps(data))
+            with self.subTest(fault=fault):
+                result = subprocess.run(['bash', '-c', preflight], cwd=self.root, env=env, text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(json.loads(fixture.read_text())['release']['draft'])
+                self.assertNotIn('resume=true', self.output.read_text())
+                state_sha = self.git('ls-remote', 'origin', module.STATE_REF).split()[0]
+                self.assertEqual([], json.loads(self.git('show', state_sha + ':state.json'))['completed'])
+            self.git('remote', 'remove', 'upstream')
+        fixture.write_text(original_fixture)
+        result = subprocess.run(['bash', '-c', preflight], cwd=self.root, env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        outputs = dict(line.split('=', 1) for line in self.output.read_text().splitlines())
+        self.assertEqual(outputs['changed'], 'false')
+        self.assertEqual(outputs['resume'], 'true')
+        self.assertEqual(outputs['candidate'], candidate)
+        state_sha = self.git('ls-remote', 'origin', module.STATE_REF).split()[0]
+        self.assertEqual([], json.loads(self.git('show', state_sha + ':state.json'))['completed'])
+        env.update(VERSION=outputs['version'], CANDIDATE=outputs['candidate'], VALIDATED_RUN=outputs['validated_run'])
+        result = subprocess.run(['bash', '-c', resume], cwd=self.root, env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(json.loads(fixture.read_text())['release']['draft'])
+        state_sha = self.git('ls-remote', 'origin', module.STATE_REF).split()[0]
+        self.assertEqual([2], json.loads(self.git('show', state_sha + ':state.json'))['completed'])
+        self.assertEqual(candidate, self.git('ls-remote', 'origin', 'refs/tags/v0.2.13').split()[0])
+        self.assertNotIn('/releases/tags/', calls.read_text())
 
     def test_observed_tag_move_fails_before_any_candidate(self):
         self.invoke([release(1), release(2)])

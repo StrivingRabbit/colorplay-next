@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """正式 Release 跟随通道；只在显式 finalize 后保存发布游标。"""
 import argparse
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -122,6 +124,18 @@ def validate_published(release, version):
     apk = next(a for a in release['assets'] if a['name'] == f'colorplay-next-{version}-release.apk')
     if not recorded or apk.get('digest') != 'sha256:' + recorded[1]:
         raise RuntimeError('正式 APK 缺少可核对的已发布摘要或摘要不符，禁止推进游标，需人工恢复')
+    checksum = next(a for a in release['assets'] if a['name'] == f'colorplay-next-{version}-release.apk.sha256')
+    expected_checksum = f'{recorded[1]}  colorplay-next-{version}-release.apk\n'.encode()
+    if (checksum.get('size') != len(expected_checksum)
+            or checksum.get('digest') != 'sha256:' + hashlib.sha256(expected_checksum).hexdigest()):
+        raise RuntimeError('校验附件摘要或大小不符，禁止推进游标，需人工恢复')
+
+
+def publisher_module():
+    spec = importlib.util.spec_from_file_location('official_publisher', ROOT / 'tools/publish-official-release.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def emit(**values):
@@ -180,15 +194,20 @@ def main():
         record = json.loads((ROOT / PROVENANCE).read_text())
         if record['release_id'] != rid or record['upstream'] != state['observed'][str(rid)]['commit']:
             raise RuntimeError('发布记录不对应当前上游 Release 精确提交')
-        own = [r for r in releases(REPO) if r['tag_name'] == 'v' + record['version'] and not r['draft'] and not r['prerelease']]
-        if len(own) != 1:
+        own = [r for r in releases(REPO) if r['tag_name'] == 'v' + record['version']]
+        if len(own) != 1 or own[0]['draft'] or own[0]['prerelease']:
             raise RuntimeError('正式发布尚未完成')
+        helper = publisher_module()
+        candidate = git('rev-parse', f"refs/tags/v{record['version']}^{{commit}}")
+        candidate_record, validator = helper.validate_git_context('v' + record['version'], candidate)
+        helper.validate_remote_tag('v' + record['version'], candidate)
+        helper.validate_release(own[0], 'v' + record['version'], candidate, candidate_record, validator)
         validate_published(own[0], record['version'])
         # 已推 tag 指向的候选是 HEAD 的祖先；只允许其上叠加元数据提交，源码/版本变化不得推进游标。
         candidate_commit = git('rev-parse', f"refs/tags/v{record['version']}^{{commit}}")
         git('merge-base', '--is-ancestor', candidate_commit, 'HEAD')
         changed = git('diff', '--name-only', '--no-renames', candidate_commit + '..HEAD').splitlines()
-        if any(not (p.startswith('.github/') or p.startswith('tools/') or p in ('README.md', 'AGENTS.md')) for p in changed):
+        if any(p == PROVENANCE or not (p.startswith('.github/') or p.startswith('tools/') or p in ('README.md', 'AGENTS.md')) for p in changed):
             raise RuntimeError('正式 tag 与当前 HEAD 之间出现源码或版本变化，禁止推进游标')
         state['completed'].append(rid)
         save_state(state, old_state)
@@ -214,11 +233,24 @@ def main():
             version = record['version']
             code = record['code']
             candidate_commit = git('rev-parse', f'refs/tags/v{version}^{{commit}}')
+            git('merge-base', '--is-ancestor', candidate_commit, 'HEAD')
             changed = git('diff', '--name-only', '--no-renames', candidate_commit + '..HEAD').splitlines()
-            if any(not (p.startswith('.github/') or p.startswith('tools/') or p in ('README.md', 'AGENTS.md')) for p in changed):
+            if any(p == PROVENANCE or not (p.startswith('.github/') or p.startswith('tools/') or p in ('README.md', 'AGENTS.md')) for p in changed):
                 raise RuntimeError('候选之后 main 出现了源码或版本变化，需人工恢复未完成的正式发布')
             if any(r['tag_name'] == 'v' + version for r in existing):
-                own = next(r for r in existing if r['tag_name'] == 'v' + version)
+                matches = [r for r in existing if r['tag_name'] == 'v' + version]
+                if len(matches) != 1:
+                    raise RuntimeError('存在重复候选 Release，必须人工恢复')
+                own = matches[0]
+                helper = publisher_module()
+                candidate_record, validator = helper.validate_git_context('v' + version, candidate_commit)
+                helper.validate_remote_tag('v' + version, candidate_commit)
+                helper.validate_release(own, 'v' + version, candidate_commit, candidate_record, validator)
+                if own['draft']:
+                    run_id = helper.find_validated_run(candidate_commit)
+                    helper.validate_alpha_version(record, validator)
+                    emit(changed='false', resume='true', version=version, candidate=candidate_commit, validated_run=run_id)
+                    return
                 validate_published(own, version)
                 if git('rev-parse', f'refs/tags/v{version}^{{commit}}') != candidate_commit:
                     raise RuntimeError('已有 tag 与 main 候选不一致')
@@ -226,6 +258,8 @@ def main():
                 save_state(state, old_state)
                 emit(changed='false')
                 return
+            if candidate_commit != original:
+                raise RuntimeError('候选之后仅有元数据但草稿缺失，禁止以新 HEAD 重建旧 APK，必须人工恢复')
             other_versions = [properties(git('show', f"refs/tags/{r['tag_name']}:version.properties"))
                               for r in existing if not r['draft']]
             if git('ls-remote', 'origin', 'refs/heads/alpha'):

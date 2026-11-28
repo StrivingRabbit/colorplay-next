@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""幂等创建/复用正式草稿、补齐附件并按数值 ID 公开；从不通过 GET /releases/tags/{tag} 回读草稿。"""
+"""校验后创建或恢复完整正式草稿并按数值 ID 公开；不补传既有草稿，不通过 tags API 回读。"""
 import argparse
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -46,7 +47,7 @@ def validate_git_context(tag, candidate, recovery=False):
     # 候选即 HEAD 是「空 diff」的退化情形。源码或版本变化一律拒绝。
     git('merge-base', '--is-ancestor', candidate, 'HEAD')
     changed = git('diff', '--name-only', '--no-renames', candidate + '..HEAD').splitlines()
-    if any(not (p.startswith('.github/') or p.startswith('tools/') or p in ('README.md', 'AGENTS.md')) for p in changed):
+    if any(p == '.github/official-release.json' or not (p.startswith('.github/') or p.startswith('tools/') or p in ('README.md', 'AGENTS.md')) for p in changed):
         raise RuntimeError('候选与 HEAD 之间出现源码或版本等非允许路径变化，禁止发布')
     record = json.loads(git('show', candidate + ':.github/official-release.json'))
     spec = importlib.util.spec_from_file_location('official_prepare', ROOT / 'tools/prepare-official-release.py')
@@ -98,6 +99,18 @@ def validate_prior_run(run_id, candidate):
             raise RuntimeError('历史运行必需门禁未通过：' + name)
 
 
+def find_validated_run(candidate):
+    base = git('rev-parse', candidate + '^1')
+    pages = api(f'repos/{REPO}/actions/workflows/official-upstream-release.yml/runs?head_sha={base}&per_page=100', paginate=True)
+    for run in [run for page in pages for run in page['workflow_runs']]:
+        try:
+            validate_prior_run(str(run['id']), candidate)
+        except (RuntimeError, ValueError):
+            continue
+        return str(run['id'])
+    raise RuntimeError('没有找到候选原始运行的完整成功门禁，必须人工恢复')
+
+
 def list_releases():
     # The list endpoint is the only read that returns drafts; GET /releases/tags/{tag} 404s for drafts.
     pages = api(f'repos/{REPO}/releases?per_page=100', paginate=True)
@@ -118,11 +131,33 @@ def create_draft(tag, title, notes_file, assets):
     subprocess.check_call(command, cwd=ROOT)
 
 
+def validate_local_assets(tag, notes_file, assets):
+    name = f'colorplay-next-{tag[1:]}-release.apk'
+    paths = {Path(path).name: Path(path) for path in assets}
+    if len(assets) != 2 or set(paths) != {name, name + '.sha256'}:
+        raise RuntimeError('本地发布附件必须是唯一的 APK 与校验文件')
+    digest = hashlib.sha256(paths[name].read_bytes()).hexdigest()
+    expected = f'{digest}  {name}\n'.encode()
+    if paths[name].stat().st_size <= 0 or paths[name + '.sha256'].read_bytes() != expected:
+        raise RuntimeError('本地 APK 或校验文件字节不符，禁止上传')
+    notes = Path(notes_file).read_text().splitlines()
+    if notes.count('- APK SHA-256：' + digest) != 1:
+        raise RuntimeError('本地 APK 与发布摘要不符，禁止上传')
+    return {'id': 1, 'tag_name': tag, 'draft': True, 'prerelease': False,
+            'body': '\n'.join(notes), 'assets': [
+                {'name': path.name, 'size': path.stat().st_size, 'state': 'uploaded',
+                 'digest': 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()}
+                for path in paths.values()]}
+
+
 def ensure_assets(tag, release, assets):
-    present = {asset.get('name') for asset in release.get('assets', [])}
+    # 已有草稿不可补传或覆盖；仅比较本地字节与服务端摘要。
     for path in assets:
-        if Path(path).name not in present:
-            subprocess.check_call(['gh', 'release', 'upload', tag, path, '--repo', REPO], cwd=ROOT)
+        data = Path(path).read_bytes()
+        matches = [a for a in release.get('assets', []) if a.get('name') == Path(path).name]
+        if (len(matches) != 1 or matches[0].get('size') != len(data)
+                or matches[0].get('digest') != 'sha256:' + hashlib.sha256(data).hexdigest()):
+            raise RuntimeError('已有附件与本地字节不符或附件缺失，禁止补传，必须人工恢复')
 
 
 def validate_release(release, tag, candidate, record, prepare):
@@ -155,20 +190,25 @@ def publish(tag, candidate, validated_run=None, title=None, notes_file=None, ass
     if validated_run is not None:
         validate_prior_run(validated_run, candidate)
     validate_remote_tag(tag, candidate)
+    if assets:
+        local = validate_local_assets(tag, notes_file, assets)
+        validate_release(local, tag, candidate, record, prepare)
     release = find_release(tag)
+    existing = release is not None
     if release is None:
-        if not (title and notes_file):
-            raise RuntimeError('必须存在唯一精确 tag 的 Release，缺失时禁止创建或猜测草稿')
+        if validated_run is not None:
+            raise RuntimeError('恢复必须复用已有完整草稿，禁止重新创建')
+        if not (title and notes_file and assets):
+            raise RuntimeError('必须存在唯一精确 tag 的 Release，缺失时必须提供已验证的摘要与两个附件')
         create_draft(tag, title, notes_file, assets)
         release = find_release(tag)
         if release is None:
             raise RuntimeError('草稿创建后仍无法通过列表定位，禁止继续')
+    validate_release(release, tag, candidate, record, prepare)
+    if existing and release['draft'] and validated_run is None:
+        validated_run = find_validated_run(candidate)
     if assets:
         ensure_assets(tag, release, assets)
-        release = find_release(tag)
-        if release is None:
-            raise RuntimeError('草稿附件补传后仍无法定位，禁止继续')
-    validate_release(release, tag, candidate, record, prepare)
     if release['draft']:
         if validated_run is not None:
             validate_alpha_version(record, prepare)
