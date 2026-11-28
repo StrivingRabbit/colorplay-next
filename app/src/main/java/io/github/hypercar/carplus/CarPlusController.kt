@@ -1,5 +1,7 @@
 package io.github.hypercar.carplus
 
+import android.app.Activity
+import android.app.ActivityOptions
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -14,20 +16,29 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** 仅在 CarPlay 控制会话就绪后打开手机入口；不更改 CarLife 协议或源端进程。 */
+/** Only opens a source entry after CONTROL_READY; OEM protocol and the receiver session remain untouched. */
 class CarPlusController(context: Context, private val log: (String) -> Unit) {
     private val context = context.applicationContext
     private val policy = CarPlusLaunchPolicy()
     private var scope: CoroutineScope? = null
     private var launchJob: Job? = null
-    private var launchTicket: CarPlusLaunchPolicy.Ticket? = null
+    private var manualJob: Job? = null
+    private var request: Request? = null
+
+    private data class Request(
+        val ticket: CarPlusLaunchPolicy.Ticket,
+        val canLaunch: () -> Boolean,
+        val sourceAwaiting: () -> Boolean,
+    )
 
     @Synchronized fun begin(attempt: Long) {
         scope?.cancel()
         policy.begin(attempt)
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         launchJob = null
-        launchTicket = null
+        manualJob = null
+        request = null
+        CarPlusDiagnostics.begin(attempt)
         log("CARPLUS_BOOT: ${BuildConfig.VERSION_NAME}/${BuildConfig.VERSION_CODE} strategy=${CarPlusSource.REVISION} attempt=$attempt")
     }
 
@@ -35,81 +46,109 @@ class CarPlusController(context: Context, private val log: (String) -> Unit) {
         attempt: Long, engine: Long, canLaunch: () -> Boolean, sourceAwaiting: () -> Boolean,
     ) {
         val ticket = policy.connected(attempt, engine) ?: return
-        if (launchTicket == ticket && launchJob != null) return
+        if (request?.ticket == ticket && launchJob != null) return
         launchJob?.cancel()
-        launchTicket = ticket
-        launchJob = scope?.launch {
-            fun allowed() = policy.current(ticket) && canLaunch() && sourceAwaiting()
-            try {
-                if (!allowed()) return@launch
-                val entry = resolveEntry()
-                ensureActive()
-                if (!allowed()) return@launch
-                if (entry == null) {
-                    log("Car+：未找到可用入口，请在 CarPlay 连接后手动打开手机 Car+ 的 CarLife 无线连接页")
-                    return@launch
-                }
-                val opened = withContext(Dispatchers.Main) {
-                    ensureActive()
-                    if (!allowed()) return@withContext null
-                    policy.dispatch(ticket, canLaunch, sourceAwaiting) {
-                        runCatching {
-                            context.startActivity(Intent().setComponent(entry).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                        }.isSuccess
-                    }
-                } ?: return@launch
-                ensureActive()
-                if (!allowed()) return@launch
-                if (opened) {
-                    log("Car+：已提交手机入口启动；后台启动可能被系统限制，若未打开请手动进入 CarLife 无线连接页，接入需实机验证")
-                } else {
-                    log("Car+：系统未允许打开入口，请手动进入 CarLife 无线连接页；无需强制授权 Shizuku")
-                }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                if (allowed()) log("Car+：入口启动失败（${error.javaClass.simpleName}），请手动进入 CarLife 无线连接页")
+        manualJob?.cancel()
+        val next = Request(ticket, canLaunch, sourceAwaiting)
+        request = next
+        launchJob = scope?.launch { launchEntry(next, context, manual = false) }
+    }
+
+    /** Must be called by a visible Activity, not a background service or a generic launcher. */
+    private fun foregroundReady(activity: Activity): Boolean =
+        !activity.isFinishing && !activity.isDestroyed &&
+            (activity as? androidx.lifecycle.LifecycleOwner)?.lifecycle?.currentState
+                ?.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) == true
+
+    @Synchronized fun launchFromForeground(activity: Activity) {
+        if (!foregroundReady(activity) || manualJob?.isActive == true) return
+        val next = request ?: return // No CONTROL_READY ticket: the button cannot start the source early.
+        launchJob?.cancel()
+        manualJob = scope?.launch { launchEntry(next, activity, manual = true) }
+    }
+
+    private suspend fun launchEntry(next: Request, launchContext: Context, manual: Boolean) {
+        val ticket = next.ticket
+        fun allowed() = policy.current(ticket) && next.canLaunch() && next.sourceAwaiting()
+        fun report(message: String) {
+            if (!policy.current(ticket)) return
+            CarPlusDiagnostics.record(ticket.attempt, ticket.engine, message)
+            log("Car+：$message")
+        }
+        try {
+            if (!allowed()) {
+                report("未提交入口：会话已变化或当前引擎已有视频，请检查首页状态")
+                return
             }
+            report("控制已就绪；正在寻找 CarLife 投屏入口（不使用智慧车载总设置页）")
+            val entry = resolveEntry { report(it) }
+            kotlin.coroutines.coroutineContext.ensureActive()
+            if (!allowed()) return
+            if (entry == null) {
+                report("没有可访问的 CarLife 投屏 Activity；请在智慧车载中点「百度 CarLife+」进入连接页。总设置页不等于引擎已启动")
+                return
+            }
+            val failure = withContext(Dispatchers.Main) {
+                ensureActive()
+                val eligible = {
+                    allowed() && (launchContext !is Activity || foregroundReady(launchContext))
+                }
+                val submit = {
+                    runCatching {
+                        val intent = Intent().setComponent(entry)
+                        if (launchContext !is Activity) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        // Mirrors ColorPlay MainActivity.Q1: explicit CarlifeActivity on the phone display.
+                        val options = ActivityOptions.makeBasic().setLaunchDisplayId(0).toBundle()
+                        launchContext.startActivity(intent, options)
+                    }
+                }
+                if (manual) policy.dispatchManual(ticket, eligible, next.sourceAwaiting, submit)
+                else policy.dispatch(ticket, eligible, next.sourceAwaiting, submit)
+            } ?: return
+            kotlin.coroutines.coroutineContext.ensureActive()
+            if (failure.isSuccess) {
+                report("已${if (manual) "前台" else "自动"}请求 ${entry.flattenToShortString()} / display=0；尚未证明源已送流，若未打开请用前台启动按钮")
+            } else {
+                report("投屏入口启动失败 ${failure.exceptionOrNull()?.javaClass?.simpleName}：${entry.flattenToShortString()}；未绕过系统权限")
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            report("入口解析失败 ${error.javaClass.simpleName}；请保留此诊断")
         }
     }
 
     @Suppress("DEPRECATION")
-    private fun resolveEntry(): ComponentName? {
+    private fun resolveEntry(report: (String) -> Unit): ComponentName? {
         val pm = context.packageManager
-        val preferred = ComponentName.unflattenFromString(CarPlusSource.COMPONENT)!!
-        fun enabled(info: android.content.pm.ActivityInfo?) =
-            info != null && info.enabled && info.applicationInfo.enabled
-        fun accessible(info: android.content.pm.ActivityInfo?): Boolean = enabled(info) && info!!.exported &&
-            (info.permission.isNullOrEmpty() || context.checkSelfPermission(info.permission) == android.content.pm.PackageManager.PERMISSION_GRANTED)
-        val info = runCatching { pm.getActivityInfo(preferred, 0) }.getOrNull()
         val candidates = mutableListOf<Pair<ComponentName, Int>>()
-        // 只枚举三个白名单包并选择一个入口，不实际轮流启动多个应用。
         for (pkg in CarPlusSource.packages) {
-            val launcher = pm.getLaunchIntentForPackage(pkg)?.component?.takeIf { it.packageName == pkg }
             val activities = runCatching {
                 pm.getPackageInfo(pkg, android.content.pm.PackageManager.GET_ACTIVITIES).activities.orEmpty().toList()
-            }.getOrDefault(emptyList())
+            }.getOrElse { report("包 $pkg 不可查询：${it.javaClass.simpleName}"); emptyList() }
             for (activity in activities) {
-                if (!accessible(activity)) continue
+                val score = CarPlusSource.entryScore(pkg, activity.name)
+                if (score <= 0) continue
                 val component = ComponentName(pkg, activity.name)
-                val score = CarPlusSource.entryScore(pkg, activity.name, component == launcher)
-                if (score > 0) candidates += component to score
-            }
-            if (launcher != null && accessible(runCatching { pm.getActivityInfo(launcher, 0) }.getOrNull())) {
-                val score = CarPlusSource.entryScore(pkg, launcher.className, launcher = true)
-                if (score > 0) candidates += launcher to score
+                val permissionOk = activity.permission.isNullOrEmpty() ||
+                    context.checkSelfPermission(activity.permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                val accessible = activity.enabled && activity.applicationInfo.enabled && activity.exported && permissionOk
+                report("候选 ${component.flattenToShortString()} score=$score enabled=${activity.enabled && activity.applicationInfo.enabled} exported=${activity.exported} permission=$permissionOk")
+                if (accessible) candidates += component to score
             }
         }
-        if (accessible(info)) candidates += preferred to 200
-        candidates.maxByOrNull { it.second }?.let { return it.first }
-        return null // Do not automatically use privileged shell to bypass a non-exported OEM entry.
+        return candidates.sortedWith(compareByDescending<Pair<ComponentName, Int>> { it.second }
+            .thenBy { it.first.flattenToShortString() }).firstOrNull()?.first
     }
 
     @Synchronized fun disconnected(attempt: Long, engine: Long) {
         if (!policy.disconnected(attempt, engine)) return
         launchJob?.cancel()
+        manualJob?.cancel()
         launchJob = null
-        launchTicket = null
+        manualJob = null
+        request = null
+        CarPlusDiagnostics.record(attempt, engine, "控制连接已失效，取消待启动入口")
     }
 
     @Synchronized fun stop(attempt: Long) {
@@ -117,6 +156,8 @@ class CarPlusController(context: Context, private val log: (String) -> Unit) {
         scope?.cancel()
         scope = null
         launchJob = null
-        launchTicket = null
+        manualJob = null
+        request?.ticket?.let { CarPlusDiagnostics.record(attempt, it.engine, "会话已停止，不再打开源入口") }
+        request = null
     }
 }

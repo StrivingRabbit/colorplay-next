@@ -1860,6 +1860,12 @@ object HyperCarRepo {
         _snapshots.update { it.copy(recentLogs = it.recentLogs + env) }
     }
 
+    /** Explicit foreground retry uses the same current CONTROL_READY ticket, never an early source launch. */
+    fun launchCarPlusFromForeground(activity: android.app.Activity) {
+        if (!sessionCarPlus || !sessionLive.get() || !streaming || userDisconnectRequested) return
+        carPlusController?.launchFromForeground(activity)
+    }
+
     // ---------------------------------------------------------------- 连接主流程
 
     private suspend fun runConnect(context: Context, diagnosticId: Long, wakePeer: String?, manual: Boolean,
@@ -5332,6 +5338,9 @@ object HyperCarRepo {
             appendLine("# ACTIVATION-GAP/PIPELINE.activation_gaps 分别核对邀请、iAP2、资源、主屏及媒体；Wi-Fi iAP2 未就绪是独立观察，不强制套用所有接收端")
             report.forEach { appendLine("# $it") }
             previousMedia.forEach { appendLine("# SAVED_MEDIA $it") }
+            appendLine("# Car+ 入口诊断（当前进程，独立于详细日志开关，不代表实际出画面）")
+            io.github.hypercar.carplus.CarPlusDiagnostics.snapshot().forEach { appendLine("# $it") }
+            appendLine("# verbose_recording=$logRecording")
             appendLine()
             logs.forEach { appendLine(it) }
         }

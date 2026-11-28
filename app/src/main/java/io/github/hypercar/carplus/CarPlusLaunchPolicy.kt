@@ -2,7 +2,7 @@ package io.github.hypercar.carplus
 
 internal object CarPlusSource {
     const val VALUE = "carplus"
-    const val REVISION = "carplus-r2"
+    const val REVISION = "carplus-r3-direct-entry"
     val packages = listOf("com.oplus.ocar", "com.oplus.carplus", "com.coloros.carplus")
     const val COMPONENT = "com.oplus.ocar/.CarlifeActivity"
     fun matches(source: String?) = source == VALUE
@@ -10,13 +10,15 @@ internal object CarPlusSource {
     fun entryScore(packageName: String, activity: String, launcher: Boolean = false): Int {
         if (!validComponent("$packageName/$activity")) return 0
         val name = activity.removePrefix(packageName).lowercase(java.util.Locale.ROOT)
-        if (name.contains("settings") || name.contains("permission")) return 0
+        if (listOf("setting", "permission", "guide", "help", "about", "download", "privacy",
+                "agreement", "intro", "splash", "web", "error", "fail", "instruction", "tips", "notice")
+                .any(name::contains)) return 0
         return when {
+            // ColorPlay MainActivity.Q1 starts this exact component on display 0, not the OEM launcher.
+            packageName == "com.oplus.ocar" && name == ".carlifeactivity" -> 1000
             name.contains("carlife") && name.contains("connect") -> 300
-            packageName == "com.oplus.ocar" && name == ".carlifeactivity" -> 200
             name.contains("carlife") -> 150
-            launcher -> 100
-            else -> 0
+            else -> 0 // A generic launcher is a settings hub, not evidence of a projection entry.
         }
     }
 
@@ -27,6 +29,32 @@ internal object CarPlusSource {
         if (!Regex("\\.?[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*").matches(activity)) return false
         return activity.startsWith('.') || activity.startsWith(parts[0] + ".")
     }
+}
+
+/** Bounded local source diagnostics remain exportable even when verbose recording is disabled. */
+object CarPlusDiagnostics {
+    private val mutableStatus = kotlinx.coroutines.flow.MutableStateFlow("尚未开始 Car+ 会话")
+    val status: kotlinx.coroutines.flow.StateFlow<String> = mutableStatus
+    private var owner = 0L
+    private var newestEngine = 0L
+    private val lines = ArrayDeque<String>()
+
+    @Synchronized fun begin(attempt: Long) {
+        owner = attempt
+        newestEngine = 0L
+        lines.clear()
+        record(attempt, 0L, "等待 CarPlay 控制就绪；CarLife 拨号任务已准备不等于源已连接")
+    }
+
+    @Synchronized fun record(attempt: Long, engine: Long, message: String) {
+        if (owner != attempt || engine < newestEngine) return
+        newestEngine = engine
+        mutableStatus.value = message
+        lines.addLast("CARPLUS_DIAG: attempt=$attempt engine=$engine $message")
+        while (lines.size > 24) lines.removeFirst()
+    }
+
+    @Synchronized fun snapshot(): List<String> = lines.toList()
 }
 
 /** Current-engine video writes, not a local CMD connection, prove that a source is already running. */
@@ -81,6 +109,15 @@ internal class CarPlusLaunchPolicy {
         ticket: Ticket, canLaunch: () -> Boolean, sourceAwaiting: () -> Boolean, submit: () -> T,
     ): T? {
         if (!claim(ticket, canLaunch(), sourceAwaiting())) return null
+        return submit()
+    }
+
+    /** Explicit foreground user action may retry after an automatic request was blocked; never revive stale work. */
+    @Synchronized fun <T : Any> dispatchManual(
+        ticket: Ticket, canLaunch: () -> Boolean, sourceAwaiting: () -> Boolean, submit: () -> T,
+    ): T? {
+        if (!current(ticket) || !canLaunch() || !sourceAwaiting()) return null
+        claimed = true
         return submit()
     }
 

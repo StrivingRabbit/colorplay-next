@@ -123,20 +123,66 @@ class CarPlusLaunchPolicyTest {
         assertFalse(policy.claim(ticket, false, false))
     }
 
-    @Test fun connectionEntryRanksAbovePreferredAndLauncher() {
+    @Test fun colorPlayDirectEntryRanksAboveGenericConnectAndNeverUsesSettingsLauncher() {
         val connect = CarPlusSource.entryScore("com.oplus.carplus", "com.oplus.carplus.carlife.CarLifeConnectActivity")
         val preferred = CarPlusSource.entryScore("com.oplus.ocar", "com.oplus.ocar.CarlifeActivity")
         val genericCarLife = CarPlusSource.entryScore("com.oplus.carplus", ".CarLifeHomeActivity")
         val launcher = CarPlusSource.entryScore("com.coloros.carplus", ".MainActivity", launcher = true)
-        assertTrue(connect > preferred)
-        assertTrue(preferred > genericCarLife)
+        assertTrue(preferred > connect)
+        assertTrue(connect > genericCarLife)
         assertTrue(genericCarLife > launcher)
-        assertTrue(launcher > 0)
+        assertEquals(0, launcher)
         assertEquals(0, CarPlusSource.entryScore("com.oplus.carplus", ".CarLifeConnectSettingsActivity", true))
         assertEquals(0, CarPlusSource.entryScore("com.oplus.carplus", ".CarLifeConnectPermissionsActivity", true))
         assertEquals(0, CarPlusSource.entryScore("com.oplus.carplus", ".UnrelatedConnectActivity"))
         assertEquals(0, CarPlusSource.entryScore("evil.pkg", ".CarLifeConnectActivity", true))
         assertEquals(0, CarPlusSource.entryScore("com.oplus.carplus", ".CarLifeConnectActivity;reboot", true))
+    }
+
+    @Test fun noGuideOrDownloadPageIsAcceptedAsProjection() {
+        for (name in listOf(".CarLifeGuideActivity", ".CarLifeConnectHelpActivity", ".CarLifeSettingActivity",
+                ".CarLifePrivacyActivity", ".CarLifeDownloadActivity", ".CarLifeIntroActivity", ".CarLifeWebActivity")) {
+            assertEquals(name, 0, CarPlusSource.entryScore("com.oplus.ocar", name, launcher = true))
+        }
+    }
+
+    @Test fun foregroundUserCanRetryButCannotReviveOldOrStopAutomaticBudget() {
+        val policy = CarPlusLaunchPolicy()
+        policy.begin(1)
+        val ticket = policy.connected(1, 10)!!
+        assertEquals(1, policy.dispatch(ticket, { true }, { true }) { 1 })
+        assertEquals(2, policy.dispatchManual(ticket, { true }, { true }) { 2 })
+        assertNull(policy.dispatch(ticket, { true }, { true }) { 3 })
+        assertNull(policy.dispatchManual(ticket, { false }, { true }) { 4 })
+        assertNull(policy.dispatchManual(ticket, { true }, { false }) { 5 })
+        policy.disconnected(1, 10)
+        assertNull(policy.dispatchManual(ticket, { true }, { true }) { 6 })
+        val current = policy.connected(1, 11)!!
+        assertEquals(7, policy.dispatchManual(current, { true }, { true }) { 7 })
+        policy.stop(1)
+        assertNull(policy.dispatchManual(current, { true }, { true }) { 8 })
+    }
+
+    @Test fun explicitForegroundActionAlsoConsumesAutomaticBudget() {
+        val policy = CarPlusLaunchPolicy()
+        policy.begin(1)
+        val ticket = policy.connected(1, 10)!!
+        assertEquals(1, policy.dispatchManual(ticket, { true }, { true }) { 1 })
+        assertNull(policy.dispatch(ticket, { true }, { true }) { 2 })
+    }
+
+    @Test fun sourceDiagnosticsAreBoundedAndIgnoreStaleEngineAndAttempt() {
+        CarPlusDiagnostics.begin(51)
+        repeat(40) { CarPlusDiagnostics.record(51, 10, "entry-$it") }
+        assertEquals(24, CarPlusDiagnostics.snapshot().size)
+        CarPlusDiagnostics.record(51, 11, "current")
+        CarPlusDiagnostics.record(51, 10, "stale engine")
+        CarPlusDiagnostics.record(50, 20, "stale attempt")
+        assertEquals("current", CarPlusDiagnostics.status.value)
+        CarPlusDiagnostics.begin(52)
+        assertEquals(1, CarPlusDiagnostics.snapshot().size)
+        CarPlusDiagnostics.record(51, 100, "prior attempt")
+        assertFalse(CarPlusDiagnostics.snapshot().any { it.contains("prior attempt") })
     }
 
     @Test fun mediaEvidenceTracksOnlyCurrentEngineVideo() {
