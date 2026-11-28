@@ -33,6 +33,8 @@ mod carlife;
 mod carwith_source;
 mod engine;
 mod modes;
+#[cfg(test)]
+mod screen_borrow_regression_tests;
 mod pairing;
 mod rtsp;
 mod resource_trace;

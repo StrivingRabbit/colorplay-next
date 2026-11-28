@@ -76,6 +76,9 @@ impl Resource {
                 }
                 if self.current == actor && self.permanent == other {
                     self.borrows = self.borrows.saturating_add(1);
+                    // Repeated Borrow also carries the receiver's current return constraint.
+                    // Ignoring a new NEVER would let requestUI reclaim a temporary display.
+                    self.unborrow = unborrow;
                     return true;
                 }
                 if self.permanent == actor || !Self::allowed(priority, self.borrow) { return false; }

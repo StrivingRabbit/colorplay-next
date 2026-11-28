@@ -185,6 +185,64 @@ class CarPlusLaunchPolicyTest {
         assertFalse(CarPlusDiagnostics.snapshot().any { it.contains("prior attempt") })
     }
 
+    @Test fun receiverYieldBlocksBothEntryPathsAndReturnRestoresOnlyPendingAutomaticBudget() {
+        val policy = CarPlusLaunchPolicy()
+        policy.begin(1)
+        val ticket = policy.connected(1, 10)!!
+        assertTrue(policy.screenOwnership(1, 10, false))
+        assertFalse(policy.canOpen(ticket))
+        assertNull(policy.dispatch(ticket, { true }, { true }) { 1 })
+        assertNull(policy.dispatchManual(ticket, { true }, { true }) { 2 })
+        assertTrue(policy.screenOwnership(1, 10, true))
+        assertTrue(policy.canAutomaticallyOpen(ticket))
+        assertEquals(3, policy.dispatch(ticket, { true }, { true }) { 3 })
+        policy.screenOwnership(1, 10, false)
+        policy.screenOwnership(1, 10, true)
+        assertFalse(policy.canAutomaticallyOpen(ticket))
+        assertNull(policy.dispatch(ticket, { true }, { true }) { 4 })
+    }
+
+    @Test fun screenYieldBeforeControlReadyIsRetainedForTheSameEngine() {
+        val policy = CarPlusLaunchPolicy()
+        policy.begin(1)
+        assertTrue(policy.screenOwnership(1, 10, false))
+        val ticket = policy.connected(1, 10)!!
+        assertFalse(policy.canOpen(ticket))
+        assertNull(policy.dispatchManual(ticket, { true }, { true }) { 1 })
+        policy.screenOwnership(1, 10, true)
+        assertTrue(policy.canOpen(ticket))
+    }
+
+    @Test fun pipelineOnlyInitializesUnknownScreenAndCannotOverrideNewerLiveYield() {
+        val policy = CarPlusLaunchPolicy()
+        policy.begin(1)
+        val ticket = policy.connected(1, 10)!!
+        assertTrue(policy.screenOwnership(1, 10, true, initialOnly = true))
+        assertFalse(policy.screenOwnership(1, 10, true, initialOnly = true))
+        policy.screenOwnership(1, 10, false)
+        assertFalse(policy.screenOwnership(1, 10, true, initialOnly = true))
+        assertFalse(policy.canOpen(ticket))
+        assertTrue(policy.screenOwnership(1, 10, true))
+        assertTrue(policy.canOpen(ticket))
+    }
+
+    @Test fun lateScreenNotificationsCannotAffectRetiredOrDifferentEngine() {
+        val policy = CarPlusLaunchPolicy()
+        policy.begin(1)
+        val old = policy.connected(1, 10)!!
+        policy.screenOwnership(1, 10, false)
+        policy.disconnected(1, 10)
+        assertFalse(policy.screenOwnership(1, 10, true))
+        val current = policy.connected(1, 11)!!
+        assertTrue(policy.canOpen(current))
+        assertFalse(policy.screenOwnership(1, 10, false))
+        assertFalse(policy.screenOwnership(2, 11, false))
+        assertFalse(policy.canOpen(old))
+        policy.stop(1)
+        assertFalse(policy.screenOwnership(1, 11, true))
+        assertFalse(policy.canOpen(current))
+    }
+
     @Test fun mediaEvidenceTracksOnlyCurrentEngineVideo() {
         val evidence = CarPlusMediaEvidence()
         assertTrue(evidence.awaiting(10))

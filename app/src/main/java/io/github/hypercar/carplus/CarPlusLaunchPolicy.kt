@@ -2,7 +2,7 @@ package io.github.hypercar.carplus
 
 internal object CarPlusSource {
     const val VALUE = "carplus"
-    const val REVISION = "carplus-r3-direct-entry"
+    const val REVISION = "carplus-r4-yield-screen"
     val packages = listOf("com.oplus.ocar", "com.oplus.carplus", "com.coloros.carplus")
     const val COMPONENT = "com.oplus.ocar/.CarlifeActivity"
     fun matches(source: String?) = source == VALUE
@@ -75,6 +75,8 @@ internal class CarPlusLaunchPolicy {
     private var engine: Long? = null
     private var generation = 0L
     private var claimed = false
+    private var receiverScreenYielded = false
+    private var screenOwnerEngine = 0L
     // EngineCallbackGate owners increase monotonically; a watermark also rejects unseen stale events.
     private var newestEngine = 0L
 
@@ -83,6 +85,8 @@ internal class CarPlusLaunchPolicy {
         engine = null
         generation++
         claimed = false
+        receiverScreenYielded = false
+        screenOwnerEngine = 0L
         newestEngine = 0L
     }
 
@@ -93,13 +97,14 @@ internal class CarPlusLaunchPolicy {
             // Some native replacements do not deliver a terminal callback. Supersede their ticket here.
             generation++
             this.engine = engine
+            if (screenOwnerEngine != engine) receiverScreenYielded = false
             newestEngine = engine
         }
         return Ticket(attempt, engine, generation)
     }
 
     @Synchronized fun claim(ticket: Ticket, canLaunch: Boolean, sourceAwaiting: Boolean): Boolean {
-        if (!current(ticket) || claimed || !canLaunch || !sourceAwaiting) return false
+        if (!current(ticket) || claimed || receiverScreenYielded || !canLaunch || !sourceAwaiting) return false
         claimed = true
         return true
     }
@@ -116,10 +121,23 @@ internal class CarPlusLaunchPolicy {
     @Synchronized fun <T : Any> dispatchManual(
         ticket: Ticket, canLaunch: () -> Boolean, sourceAwaiting: () -> Boolean, submit: () -> T,
     ): T? {
-        if (!current(ticket) || !canLaunch() || !sourceAwaiting()) return null
+        if (!current(ticket) || receiverScreenYielded || !canLaunch() || !sourceAwaiting()) return null
         claimed = true
         return submit()
     }
+
+    /** A live receiver ownership notification is authoritative; never infer a gear/camera state. */
+    @Synchronized fun screenOwnership(attempt: Long, engine: Long, owned: Boolean, initialOnly: Boolean = false): Boolean {
+        if (owner != attempt || engine <= 0 || engine < newestEngine ||
+            (this.engine != engine && engine == newestEngine) || (initialOnly && screenOwnerEngine == engine)) return false
+        val changed = screenOwnerEngine != engine || receiverScreenYielded == owned
+        screenOwnerEngine = engine
+        receiverScreenYielded = !owned
+        return changed
+    }
+
+    @Synchronized fun canOpen(ticket: Ticket): Boolean = current(ticket) && !receiverScreenYielded
+    @Synchronized fun canAutomaticallyOpen(ticket: Ticket): Boolean = canOpen(ticket) && !claimed
 
     @Synchronized fun current(ticket: Ticket): Boolean =
         owner == ticket.attempt && engine == ticket.engine && generation == ticket.generation

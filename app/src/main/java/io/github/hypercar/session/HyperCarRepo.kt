@@ -4090,6 +4090,9 @@ object HyperCarRepo {
                 else s.copy(pipeline = next)
             }
             if (_snapshots.value.pipeline == next) {
+                if (sessionCarPlus) next.screenOwned?.let { owned ->
+                    carPlusController?.screenOwnership(connectionAttemptId, engineCallbacks.current(), owned, initialOnly = true)
+                }
                 next.videoTcpEvidence?.let { connectionDiagnostics.videoSample(connectionAttemptId, engineCallbacks.current(), it) }
                 // Bounded observation only: no retry, ownership claim or success inference.
                 val key = "${next.activationLabel}/${next.wifiIap2}/${next.audioReady}"
@@ -4370,6 +4373,10 @@ object HyperCarRepo {
         }
 
         override fun onReceiverUi(kind: String, payload: String) {
+            if (sessionCarPlus && kind == "screenOwned") {
+                val owned = runCatching { org.json.JSONObject(payload).getBoolean("owned") }.getOrNull()
+                if (owned != null) carPlusController?.screenOwnership(connectionAttemptId, engineCallbacks.current(), owned)
+            }
             if (!sessionCarLifeMode) io.github.hypercar.carui.CarReceiverUi.handle(kind, payload)
         }
 

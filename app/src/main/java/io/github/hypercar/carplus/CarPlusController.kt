@@ -46,20 +46,39 @@ class CarPlusController(context: Context, private val log: (String) -> Unit) {
         attempt: Long, engine: Long, canLaunch: () -> Boolean, sourceAwaiting: () -> Boolean,
     ) {
         val ticket = policy.connected(attempt, engine) ?: return
-        if (request?.ticket == ticket && launchJob != null) return
+        if (request?.ticket == ticket && launchJob?.isActive == true) return
         launchJob?.cancel()
         manualJob?.cancel()
         val next = Request(ticket, canLaunch, sourceAwaiting)
         request = next
-        launchJob = scope?.launch { launchEntry(next, context, manual = false) }
+        // A receiver may take the screen before CONTROL_READY. Keep the request pending
+        // without leaving a completed Job reference that would block the later return.
+        launchJob = if (policy.canAutomaticallyOpen(ticket))
+            scope?.launch { launchEntry(next, context, manual = false) } else null
     }
 
-    /** Must be called by a visible Activity, not a background service or a generic launcher. */
+    /** Yield pending entry requests to receiver-owned UI; resume only an unconsumed automatic request. */
+    @Synchronized fun screenOwnership(attempt: Long, engine: Long, owned: Boolean, initialOnly: Boolean = false) {
+        if (!policy.screenOwnership(attempt, engine, owned, initialOnly)) return
+        if (!owned) {
+            launchJob?.cancel()
+            manualJob?.cancel()
+            launchJob = null
+            manualJob = null
+            CarPlusDiagnostics.record(attempt, engine, "车机暂时持有屏幕，暂停打开 Car+；等待车机归还，不主动抢回")
+        } else {
+            val next = request?.takeIf { it.ticket.attempt == attempt && it.ticket.engine == engine } ?: return
+            if (launchJob?.isActive != true && policy.canAutomaticallyOpen(next.ticket))
+                launchJob = scope?.launch { launchEntry(next, context, manual = false) }
+        }
+    }
+
     private fun foregroundReady(activity: Activity): Boolean =
         !activity.isFinishing && !activity.isDestroyed &&
             (activity as? androidx.lifecycle.LifecycleOwner)?.lifecycle?.currentState
                 ?.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) == true
 
+    /** Must be called by a visible Activity, not a background service or a generic launcher. */
     @Synchronized fun launchFromForeground(activity: Activity) {
         if (!foregroundReady(activity) || manualJob?.isActive == true) return
         val next = request ?: return // No CONTROL_READY ticket: the button cannot start the source early.
@@ -69,7 +88,7 @@ class CarPlusController(context: Context, private val log: (String) -> Unit) {
 
     private suspend fun launchEntry(next: Request, launchContext: Context, manual: Boolean) {
         val ticket = next.ticket
-        fun allowed() = policy.current(ticket) && next.canLaunch() && next.sourceAwaiting()
+        fun allowed() = policy.canOpen(ticket) && next.canLaunch() && next.sourceAwaiting()
         fun report(message: String) {
             if (!policy.current(ticket)) return
             CarPlusDiagnostics.record(ticket.attempt, ticket.engine, message)

@@ -1599,21 +1599,18 @@ fun CarSourceSection(
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SectionLabel(text = title)
             GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
-                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                    listOf("car_ui" to "自绘界面", "carwith" to "CarWith", "system_carlife" to "CarLife+").forEachIndexed { index, (source, label) ->
-                        SegmentedButton(
-                            selected = current == source,
-                            enabled = !connected && when(source) { "car_ui" -> startup.shizukuReady; "carwith" -> startup.carWithInstalled; else -> true },
-                            onClick = { selectSource(source) },
-                            shape = SegmentedButtonDefaults.itemShape(index = index, count = 3),
-                            label = { Text(label, style = MaterialTheme.typography.labelMedium) },
-                        )
-                    }
-                }
+                io.github.hypercar.carplus.CarSourceSelector(
+                    current = current,
+                    shizukuReady = startup.shizukuReady,
+                    carWithInstalled = startup.carWithInstalled,
+                    carPlusInstalled = startup.carPlusInstalled,
+                    connected = connected,
+                    onSelect = ::selectSource,
+                )
                 Spacer(Modifier.height(8.dp))
                 Text(when {
                     connected -> "断开连接后可切换画面来源。"
-                    io.github.hypercar.carplus.CarPlusSource.matches(current) -> "CarPlay 控制会话就绪后再启动，接入系统CarLife通道，需实机验证。"
+                    io.github.hypercar.carplus.CarPlusSource.matches(current) -> "连接就绪后自动启动 Car+ 画面，无需 Shizuku。"
                     current == "system_carlife" -> "在手机车联中打开 CarLife+ 的无线连接并开始连接，保持页面等待，ColorPlay Next 会自动接入。"
                     current == "carwith" -> "CarWith 画面按车机屏幕自动换算并按需拉伸，源画面最高 2560×2560，无需手动设置。"
                     !startup.shizukuReady -> "自绘 UI 需先在「权限与后台」完成 Shizuku 授权。"
@@ -1626,7 +1623,12 @@ fun CarSourceSection(
                     SystemCarLifeSettingsShortcut(!connected)
                     SystemCarLifeCallAudioSwitch(!connected)
                 }
-                CarPlusSourceCard(current, startup.carPlusInstalled, !connected) { selectSource(io.github.hypercar.carplus.CarPlusSource.VALUE) }
+                if (io.github.hypercar.carplus.CarPlusSource.matches(current)) {
+                    io.github.hypercar.carplus.CarPlusConnectionHelp()
+                } else if (!startup.carPlusInstalled) {
+                    Text("未检测到可用的 Car+，此选项不可用。", color = AmberWarning,
+                        style = MaterialTheme.typography.bodySmall)
+                }
                 if (!startup.carWithInstalled && current != "system_carlife" && !io.github.hypercar.carplus.CarPlusSource.matches(current)) {
                     Text("未安装系统 CarWith，此选项不可用。", color = AmberWarning,
                         style = MaterialTheme.typography.bodySmall)
@@ -1717,27 +1719,7 @@ fun CarSourceSection(
 
 @Composable
 private fun CarPlusSourceCard(current: String?, installed: Boolean, enabled: Boolean, onSelect: () -> Unit) {
-    val selected = io.github.hypercar.carplus.CarPlusSource.matches(current)
-    val sourceStatus by io.github.hypercar.carplus.CarPlusDiagnostics.status.collectAsStateWithLifecycle()
-    val session by HyperCarRepo.snapshots.collectAsStateWithLifecycle()
-    val context = LocalContext.current
-    val activity = generateSequence(context) { (it as? android.content.ContextWrapper)?.baseContext }
-        .filterIsInstance<android.app.Activity>().firstOrNull()
-    Text("Car+ 车联", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
-    Text("CarPlay 控制会话就绪后再启动，接入系统CarLife通道，需实机验证。无需强制授权 Shizuku。",
-        color = TextSecondary, style = MaterialTheme.typography.bodySmall)
-    CapsuleButton(if (selected) "已选择 Car+ 车联" else "选择 Car+ 车联",
-        onClick = onSelect, enabled = enabled && installed,
-        modifier = Modifier.fillMaxWidth(), filled = selected)
-    if (selected) {
-        Text(sourceStatus, color = TextSecondary, style = MaterialTheme.typography.bodySmall)
-        CapsuleButton("前台启动 Car+ 画面", onClick = { activity?.let(HyperCarRepo::launchCarPlusFromForeground) },
-            enabled = activity != null && session.link is io.github.hypercar.core.LinkState.Connected,
-            modifier = Modifier.fillMaxWidth(), filled = false)
-    }
-    Text(if (installed) "优先直接打开系统 CarLife 投屏 Activity，不回退到智慧车载总设置页。若仍未启动，请在该总页点「百度 CarLife+」；只有送来视频帧才算源已出流。"
-        else "未检测到可用的 OPPO / 一加 Car+ 车联，请先安装或启用手机自带车联。",
-        color = if (installed) TextSecondary else AmberWarning, style = MaterialTheme.typography.bodySmall)
+    io.github.hypercar.carplus.CarPlusSourceCard(current, installed, enabled, onSelect)
 }
 
 @Composable
