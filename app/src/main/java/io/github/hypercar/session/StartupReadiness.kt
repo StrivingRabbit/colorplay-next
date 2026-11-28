@@ -10,6 +10,7 @@ data class StartupReadiness(
     val shizukuReady: Boolean = false,
     val carWithInstalled: Boolean = false,
     val overlayAllowed: Boolean = false,
+    val carPlusInstalled: Boolean = false,
 ) {
     val manualIssues: List<String> get() = buildList {
         addAll(missingPermissions)
@@ -21,6 +22,7 @@ data class StartupReadiness(
             "carwith" -> if (!carWithInstalled) add("安装并启用系统 CarWith（com.miui.carlink）")
             // User starts the phone's own WLAN connection screen; no Xiaomi dependency.
             "system_carlife" -> Unit
+            io.github.hypercar.carplus.CarPlusSource.VALUE -> if (!carPlusInstalled) add("安装并启用手机自带的 Car+ 车联（OPPO / 一加）")
             else -> add("选择车机画面来源")
         }
     }

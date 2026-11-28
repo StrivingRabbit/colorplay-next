@@ -51,6 +51,14 @@ Alpha 用于提前体验自动合入的 HyperCar 新底座，可能存在连接�
 - 升级顺序：干净工作区 → `git fetch upstream main` → 对比 `UpstreamBase.COMMIT..upstream/main` → 在独立升级分支合并 → 审查 OPPO / UI 接入冲突 → JVM、原生、Release Lint 和真机回归 → 更新底座记录并用原证书发布。fetch 失败时不更新底座记录。
 - 尽可能将定制封装在独立文件；必须修改的会话接入点保持小范围，不能保证完全无冲突。应用内“检查更新”只检查 ColorPlay Next APK，不直接替换底座、不安装 HyperCar APK。
 
+## Car+ 车联（0.2.15）
+
+- 在“设置 → 画面来源”选择 **Car+ 车联**；只检测 OPPO / 一加 / ColorOS 的 `com.oplus.ocar`、`com.oplus.carplus`、`com.coloros.carplus`，缺少系统应用时不允许连接。无需把 Shizuku 设为硬性前置条件。
+- 本地 CarLife 接收/拨号服务可预热，但不会因此打开 Car+。只有当前 CarPlay 引擎完成控制协商、回报 `connected / CONTROL_READY` 后，才尝试打开手机 Car+ 的画面入口；不以蓝牙连接、监听 7240、开始拨号或等待视频首帧作为触发条件。
+- 启动按连接 attempt 与引擎 owner 隔离；停止、断开及旧回调会取消尚未提交的动作。同轮连接只执行一次自动启动流程，已有当前引擎视频帧时不重复打开源端（以即时首帧流水线信号和周期统计共同判定，不以本地 CMD 连接为准）。只使用可导出的普通入口，不自动用特权 shell 绕过非导出入口。启动请求被 Android 后台限制时可能需要用户手动进入手机 Car+ 的 CarLife 无线连接页，不把提交 Intent 当成已出画面。
+- `carplus/CarPlusController.kt` 与 `CarPlusLaunchPolicy.kt` 隔离组件发现、延迟启动和代次预算；通过少量来源策略与生命周期接入点复用现有系统 CarLife / AirPlay 通道，不修改 Rust 协议、不添加 JNI、不替换参考 APK 的二进制。原自绘 UI、CarWith 和系统 CarLife+ 模式保持原启动策略。
+- 此来源尚待 OPPO / 一加真机及实车验证，包括触摸、声音和重连；发布不代表已完成实车验收。自动跟随上游仍遵守完整测试、验签与源码冲突中止规则；不能保证任意未来上游改动零冲突，禁止为保留定制而整文件自动选边。
+
 ## 上游正式 Release 自动跟随
 
 - 用户授权的正式发布通道使用工作流“跟随上游官方正式 Release”，每小时检查一次 `fw867/hypercar` 的正式 Release（GitHub 定时任务可能延迟）；草稿和预发布不触发正式版。现有每日北京时间 06:00 的 Alpha 通道继续独立运行。

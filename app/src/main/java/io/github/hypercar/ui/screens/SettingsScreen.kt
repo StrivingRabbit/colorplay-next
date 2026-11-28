@@ -1589,6 +1589,7 @@ fun CarSourceSection(
         if (connected) return
         if (source == "car_ui" && !ShizukuTools.isReady) return
         if (source == "carwith" && !io.github.hypercar.session.StartupRequirements.carWithInstalled(ctx)) return
+        if (io.github.hypercar.carplus.CarPlusSource.matches(source) && !startup.carPlusInstalled) return
         SettingsStore.carSource = source
         io.github.hypercar.settings.SettingsRevision.bump()
         HyperCarRepo.log("STARTUP: 画面来源=$source，重新检查启动条件")
@@ -1612,6 +1613,7 @@ fun CarSourceSection(
                 Spacer(Modifier.height(8.dp))
                 Text(when {
                     connected -> "断开连接后可切换画面来源。"
+                    io.github.hypercar.carplus.CarPlusSource.matches(current) -> "CarPlay 控制会话就绪后再启动，接入系统CarLife通道，需实机验证。"
                     current == "system_carlife" -> "在手机车联中打开 CarLife+ 的无线连接并开始连接，保持页面等待，ColorPlay Next 会自动接入。"
                     current == "carwith" -> "CarWith 画面按车机屏幕自动换算并按需拉伸，源画面最高 2560×2560，无需手动设置。"
                     !startup.shizukuReady -> "自绘 UI 需先在「权限与后台」完成 Shizuku 授权。"
@@ -1624,7 +1626,8 @@ fun CarSourceSection(
                     SystemCarLifeSettingsShortcut(!connected)
                     SystemCarLifeCallAudioSwitch(!connected)
                 }
-                if (!startup.carWithInstalled && current != "system_carlife") {
+                CarPlusSourceCard(current, startup.carPlusInstalled, !connected) { selectSource(io.github.hypercar.carplus.CarPlusSource.VALUE) }
+                if (!startup.carWithInstalled && current != "system_carlife" && !io.github.hypercar.carplus.CarPlusSource.matches(current)) {
                     Text("未安装系统 CarWith，此选项不可用。", color = AmberWarning,
                         style = MaterialTheme.typography.bodySmall)
                 }
@@ -1699,6 +1702,10 @@ fun CarSourceSection(
                 modifier = Modifier.fillMaxWidth(), filled = current == "system_carlife")
             SystemCarLifeSettingsShortcut(!connected)
             if (current == "system_carlife") SystemCarLifeCallAudioSwitch(!connected)
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            Spacer(Modifier.height(16.dp))
+            CarPlusSourceCard(current, startup.carPlusInstalled, !connected) { selectSource(io.github.hypercar.carplus.CarPlusSource.VALUE) }
             if (!compact) {
                 Spacer(Modifier.height(8.dp))
                 Text("从安装或授权页面返回后会自动重新检查。", color = TextSecondary,
@@ -1706,6 +1713,20 @@ fun CarSourceSection(
             }
         }
     }
+}
+
+@Composable
+private fun CarPlusSourceCard(current: String?, installed: Boolean, enabled: Boolean, onSelect: () -> Unit) {
+    val selected = io.github.hypercar.carplus.CarPlusSource.matches(current)
+    Text("Car+ 车联", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
+    Text("CarPlay 控制会话就绪后再启动，接入系统CarLife通道，需实机验证。无需强制授权 Shizuku。",
+        color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+    CapsuleButton(if (selected) "已选择 Car+ 车联" else "选择 Car+ 车联",
+        onClick = onSelect, enabled = enabled && installed,
+        modifier = Modifier.fillMaxWidth(), filled = selected)
+    Text(if (installed) "若系统限制后台启动或没有有效入口，请在 CarPlay 连接后手动打开手机 Car+ 中的 CarLife 无线连接页。"
+        else "未检测到可用的 OPPO / 一加 Car+ 车联，请先安装或启用手机自带车联。",
+        color = if (installed) TextSecondary else AmberWarning, style = MaterialTheme.typography.bodySmall)
 }
 
 @Composable

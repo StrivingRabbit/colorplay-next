@@ -93,7 +93,12 @@ object HyperCarRepo {
     private val connectionDiagnostics = ConnectionDiagnostics(SystemClock::elapsedRealtime)
     @Volatile private var wifiLosses = WifiLossSnapshots<Network>(0L)
     private val connectionAttemptId get() = wifiLosses.attempt
-    private val carWithEntries = CarWithEntryGate { RustCoreBridge.nativeStopCarWith(it) }
+    @Volatile private var carPlusController: io.github.hypercar.carplus.CarPlusController? = null
+    private val carPlusMedia = io.github.hypercar.carplus.CarPlusMediaEvidence()
+    private val carWithEntries = CarWithEntryGate {
+        carPlusController?.stop(it)
+        RustCoreBridge.nativeStopCarWith(it)
+    }
     private val systemCarLifeLaunch = SystemCarLifeLaunchPolicy()
 
     private fun finishDiagnostic(outcome: String, reason: String) {
@@ -385,7 +390,8 @@ object HyperCarRepo {
     @Volatile private var sessionCarSource = "car_ui"
     @Volatile private var sessionCallAudioEnabled = false
     private val sessionCarLifeMode: Boolean get() = CarLifeSourcePolicy.isGateway(sessionCarSource)
-    private val sessionSystemCarLife: Boolean get() = sessionCarSource == "system_carlife"
+    private val sessionSystemCarLife: Boolean get() = CarLifeSourcePolicy.isSystem(sessionCarSource)
+    private val sessionCarPlus: Boolean get() = io.github.hypercar.carplus.CarPlusSource.matches(sessionCarSource)
     @Volatile private var sessionIdentity: PairingIdentityFiles.Location? = null
     private var automaticResumeJob: Job? = null
     private val automaticModeRequest = AtomicLong()
@@ -979,6 +985,11 @@ object HyperCarRepo {
         aclEdge?.ticket?.assign(connectionAttemptId)
         if (sessionCarLifeMode) carWithEntries.begin(connectionAttemptId)
         systemCarLifeLaunch.begin(connectionAttemptId, manual, SystemClock.elapsedRealtime())
+        if (sessionCarPlus) {
+            val controller = carPlusController ?: io.github.hypercar.carplus.CarPlusController(context.applicationContext, ::log)
+                .also { carPlusController = it }
+            controller.begin(connectionAttemptId)
+        }
         sessionLive.set(true)
         val inboundPeer = SettingsStore.targetCarMac ?: wakePeer ?:
             if (sessionCarLifeMode) connectionDiagnostics.currentAclWakePeer(connectionAttemptId) else null
@@ -2507,7 +2518,10 @@ object HyperCarRepo {
                 val wifiLoss = autoConnectChanges.withLock {
                     kotlinx.coroutines.currentCoroutineContext().ensureActive()
                     if (!sessionLive.get() || connectionAttemptId != diagnosticId || sessionSockets !== sockets) return
+                    // Media activation can be replaced without a terminal native callback; retire the deferred Car+ ticket.
+                    val retiringEngine = engineCallbacks.current()
                     engineCallbacks.retire()
+                    if (sessionCarPlus) carPlusController?.disconnected(diagnosticId, retiringEngine)
                     SettingsStore.receiverMaxFps = null
                     io.github.hypercar.carui.CarDisplayLayout.viewAreaChoices.value = null
                     io.github.hypercar.carui.CarReceiverUi.reset()
@@ -4056,6 +4070,8 @@ object HyperCarRepo {
                 next.generation >= _snapshots.value.pipeline.generation) {
                 reconnectBudget.videoReady(retryReceiver(), SystemClock.elapsedRealtime())
                 connectionDiagnostics.mark(connectionAttemptId, ConnectionDiagnostics.Stage.FIRST_VIDEO_FRAME)
+                // Immediate evidence (before the 1s stats tick) that this engine already pushes video.
+                if (sessionCarPlus) carPlusMedia.observe(engineCallbacks.current(), next.writtenFrames)
                 fallbackToRemember?.let { identity ->
                     fallbackToRemember = null
                     if (SettingsStore.savedPhoneMac.remember(identity.settingsRevision, identity.address))
@@ -4106,6 +4122,9 @@ object HyperCarRepo {
             }
             if (wifiLosses !== losses) return
             if (!sessionLive.get() && state in setOf("activation", "negotiating", "connected", "failed", "ended")) return
+            if (state in setOf("negotiating", "failed", "ended", "error", "stopping")) {
+                carPlusController?.disconnected(connectionAttemptId, callbackOwner)
+            }
             val activation = proactiveActivation.get()
             if (state in setOf("failed", "ended", "error") && activation?.interceptTerminal(detail) == true) {
                 log("CORE: [$state] $detail")
@@ -4168,6 +4187,18 @@ object HyperCarRepo {
                     connectionDiagnostics.report().lastOrNull()?.let { log(it) }
                     MusicBridge.onCarConnected(callbackOwner)
                     streaming = true
+                    if (sessionCarPlus) {
+                        carPlusController?.connected(diagnosticId, callbackOwner,
+                            canLaunch = {
+                                sessionLive.get() && streaming && !userDisconnectRequested &&
+                                    connectionAttemptId == diagnosticId && sessionCarPlus &&
+                                    SettingsStore.carSource == sessionCarSource && carWithEntries.current(diagnosticId) &&
+                                    engineCallbacks.isCurrent(callbackOwner) && engineCallbacks.projectionOwner.value == callbackOwner
+                            },
+                            // A connected local CMD socket is not proof of video. Only current-engine
+                            // frame statistics suppress a deferred launch of an already running source.
+                            sourceAwaiting = { carPlusMedia.awaiting(callbackOwner) })
+                    }
                     // 配对成功过 → 记一笔（设置页「目标车机」列表给它打「已配对」标记）。
                     // 蓝牙已配对 ≠ CarPlay 配对过：只有会话真正激活（RECORD 完成）才算。
                     runCatching {
@@ -4284,6 +4315,8 @@ object HyperCarRepo {
         }
 
         override fun onCarWithReopen(attempt: Long, startup: Boolean) {
+            // Car+ owns a separate deferred launcher; source refusal must never open it before CONTROL_READY.
+            if (sessionCarPlus) return
             if (sessionSystemCarLife && startup && StartupRequirements.oppoSystemCarLifeInstalled(appContext() ?: return)) {
                 scope.launch {
                     val ctx = appContext() ?: return@launch
@@ -4361,6 +4394,7 @@ object HyperCarRepo {
         }
 
         override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
+            if (sessionCarPlus && frames > 0) carPlusMedia.observe(engineCallbacks.current(), frames)
             if (audioPlaying != lastAudioPlaying) {
                 lastAudioPlaying = audioPlaying
                 log("AUDIO: playing=$audioPlaying ducking=$ducking")
@@ -5508,9 +5542,13 @@ object HyperCarRepo {
                 CarUiCaster.releaseForCarWith()
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 if (!current()) return@launch
-                log("CARWITH: 车联守候与接收服务就绪；启动源端 attempt=$diagnosticId；独立保持至本轮连接结束")
+                log("CARWITH: 车联守候与接收服务就绪 attempt=$diagnosticId；独立保持至本轮连接结束")
                 val launchTime = System.currentTimeMillis()
-                val result = if (sessionSystemCarLife) waitForSystemCarLife(context,diagnosticId) else launchCarWith(context, diagnosticId)
+                val result = when {
+                    sessionCarPlus -> "Car+ 接收服务已预热；等待 CarPlay CONTROL_READY 后再打开画面入口"
+                    sessionSystemCarLife -> waitForSystemCarLife(context,diagnosticId)
+                    else -> launchCarWith(context, diagnosticId)
+                }
                 if (!current()) return@launch
                 val version = runCatching {
                     val pkg=if (sessionSystemCarLife) StartupRequirements.systemCarLifePackage(context) else StartupRequirements.CARWITH_PACKAGE

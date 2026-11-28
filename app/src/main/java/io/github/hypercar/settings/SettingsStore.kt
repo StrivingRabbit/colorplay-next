@@ -337,7 +337,7 @@ object SettingsStore {
 
     /** 是否 CarWith 模式。 */
     val carWithMode: Boolean get() = carSource == "carwith"
-    val systemCarLifeMode: Boolean get() = carSource == "system_carlife"
+    val systemCarLifeMode: Boolean get() = io.github.hypercar.session.CarLifeSourcePolicy.isSystem(carSource)
     val carLifeMode: Boolean get() = io.github.hypercar.session.CarLifeSourcePolicy.isGateway(carSource)
 
     var systemCarLifeCallAudio: Boolean

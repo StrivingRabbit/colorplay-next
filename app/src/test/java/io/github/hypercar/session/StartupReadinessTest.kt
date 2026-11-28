@@ -34,6 +34,15 @@ class StartupReadinessTest {
         assertFalse(system.copy(missingPermissions=listOf("附近设备")).manualReady)
     }
 
+    @Test fun carPlusRequiresKnownOemPackageWithoutShizukuDependency() {
+        val carPlus = ready.copy(source = "carplus", shizukuReady = false, carPlusInstalled = true)
+        assertTrue(carPlus.manualReady)
+        assertTrue(carPlus.automaticReady)
+        assertFalse(carPlus.copy(carPlusInstalled = false, shizukuReady = true).manualReady)
+        assertFalse(carPlus.copy(overlayAllowed = false).automaticReady)
+        assertFalse(carPlus.copy(wifiEnabled = false).manualReady)
+    }
+
     @Test fun requiredPermissionRevocationBlocksBothEntries() {
         for (permission in listOf("附近设备", "通知", "定位")) {
             val blocked = ready.copy(missingPermissions = listOf(permission))

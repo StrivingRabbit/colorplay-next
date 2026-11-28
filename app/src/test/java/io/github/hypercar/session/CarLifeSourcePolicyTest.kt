@@ -35,6 +35,16 @@ class CarLifeSourcePolicyTest {
         assertTrue(CarLifeSourcePolicy.isGateway("system_carlife"))
         for (source in listOf("car_ui","dex","unknown","")) assertFalse(CarLifeSourcePolicy.isGateway(source))
     }
+    @Test fun carPlusUsesSystemGatewayButDoesNotReopenSource() {
+        assertTrue(CarLifeSourcePolicy.isGateway("carplus"))
+        assertTrue(CarLifeSourcePolicy.isSystem("carplus"))
+        assertTrue(CarLifeSourcePolicy.isSystem("system_carlife"))
+        assertFalse(CarLifeSourcePolicy.isSystem("carwith"))
+        assertFalse(CarLifeSourcePolicy.shouldReopen("carplus", false))
+        assertFalse(CarLifeSourcePolicy.shouldReopen("carplus", true))
+        assertFalse(CarLifeSourcePolicy.allowsCallAudio("carplus", true))
+    }
+
     @Test fun liveSystemEngineIsNeverRelaunchedForALateDisplay() {
         assertTrue(CarLifeSourcePolicy.shouldReopen("carwith",false))
         assertTrue(CarLifeSourcePolicy.shouldReopen("carwith",true))

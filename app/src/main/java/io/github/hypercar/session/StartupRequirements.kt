@@ -47,6 +47,11 @@ object StartupRequirements {
         context.packageManager.getApplicationInfo(CARWITH_PACKAGE, 0).enabled
     }.getOrDefault(false)
 
+    @Suppress("DEPRECATION")
+    fun carPlusInstalled(context: Context): Boolean = io.github.hypercar.carplus.CarPlusSource.packages.any {
+        runCatching { context.packageManager.getApplicationInfo(it, 0).enabled }.getOrDefault(false)
+    }
+
     fun read(context: Context): StartupReadiness = StartupReadiness(
         source = SettingsStore.carSource.takeIf { SettingsStore.carSourceSelected },
         missingPermissions = AppPermissions.missingRequired(context).map {
@@ -66,6 +71,7 @@ object StartupRequirements {
         locationEnabled = AppPermissions.isLocationServiceOn(context),
         shizukuReady = ShizukuTools.isReady,
         carWithInstalled = carWithInstalled(context),
+        carPlusInstalled = carPlusInstalled(context),
         overlayAllowed = AppPermissions.hasOverlay(context),
     )
 }

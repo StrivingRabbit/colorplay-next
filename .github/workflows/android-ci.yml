@@ -21,8 +21,7 @@
 #   KEY_ALIAS          keyAlias
 #   KEY_PASSWORD       keyPassword
 # 可选：
-#   EXPECTED_CERT_SHA256  期望的签名证书 SHA-256（带不带冒号都行）——配了就会逐字比对，
-#                         防止误用别的 keystore 签出「正式版」。
+#   EXPECTED_CERT_SHA256  额外签名指纹检查；无论是否配置，固定正式证书硬门禁始终生效。
 #
 # **没有 KEYSTORE_BASE64 会直接失败**，绝不退回 debug 签名：
 # debug 证书签出去的包，日后换正式证书时所有用户必须卸载重装（签名是不可逆决定）。
@@ -120,6 +119,13 @@ jobs:
           key: rust-core-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.toml') }}
           restore-keys: rust-core-${{ runner.os }}-
 
+      - name: Rust 全量单元测试
+        working-directory: rust-core
+        env:
+          CMAKE_GENERATOR: Ninja
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: cargo test --lib
+
       - name: 编译 Rust 核心层 → jniLibs
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -208,12 +214,13 @@ jobs:
         run: |
           set -eu
           chmod +x gradlew
-          ./gradlew :app:assembleRelease -Phypercar.officialBuild=true --stacktrace
+          ./gradlew :app:lintRelease :app:testDebugUnitTest :app:assembleRelease -Phypercar.officialBuild=true --stacktrace
 
       - name: 校验签名并打包
         id: package
         env:
           VERSION: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
           EXPECTED_CERT: ${{ secrets.EXPECTED_CERT_SHA256 }}
         run: |
           set -eu
@@ -223,36 +230,37 @@ jobs:
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           APKSIGNER=$(ls "$SDK"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n1)
           test -n "$APKSIGNER" || { echo "::error::找不到 apksigner"; exit 1; }
-          "$APKSIGNER" verify --print-certs "$APK" | tee certs.txt
-
-          # 配了 keystore 却仍是 debug 证书 = keystore.properties 没被读到，绝不能放出去
-          if grep -q "CN=Android Debug" certs.txt; then
-            echo "::error::产物是 debug 签名——正式签名配置没有生效（检查 keystore.properties 与 storeFile 路径）"
-            exit 1
-          fi
-          CERT=$(grep "certificate SHA-256 digest" certs.txt | head -n1 | sed 's/.*digest: //')
-          test -n "$CERT" || { echo "::error::读不到签名证书指纹"; exit 1; }
-
-          if [ -n "${EXPECTED_CERT:-}" ]; then
-            EXPECTED=$(printf '%s' "$EXPECTED_CERT" | tr -d ': ' | tr 'A-F' 'a-f')
-            ACTUAL=$(printf '%s' "$CERT" | tr -d ': ' | tr 'A-F' 'a-f')
-            if [ "$EXPECTED" != "$ACTUAL" ]; then
-              echo "::error::签名证书与 EXPECTED_CERT_SHA256 不一致：期望 $EXPECTED，实际 $ACTUAL"
-              exit 1
-            fi
-            echo "签名证书与 EXPECTED_CERT_SHA256 一致"
-          fi
-
-          # 附带核对 APK 内确有 Rust 核心层（防止 cargo-ndk 产物没被打包的静默失败）
-          if command -v unzip >/dev/null 2>&1; then
-            unzip -l "$APK" | grep -q "lib/arm64-v8a/libhypercar_core.so" \
-              || { echo "::error::APK 内缺少 libhypercar_core.so——cargo-ndk 产物未进入打包目录"; exit 1; }
-            echo "APK 内 libhypercar_core.so 已确认"
-          fi
+          "$APKSIGNER" verify --print-certs "$APK" > certs.txt
+          AAPT="$(dirname "$APKSIGNER")/aapt2"
+          "$AAPT" dump badging "$APK" > badging.txt
+          python3 - <<'PYIDENTITY'
+          import os, re, zipfile
+          from pathlib import Path
+          expected = 'e367837a3305e5fceff996028355d3b2c3fff26260af5572d287d732d1472d66'
+          normalize = lambda value: re.sub(r'[:\s]', '', value).lower()
+          certs = Path('certs.txt').read_text()
+          fingerprints = re.findall(r'^(?:Signer #\d+|V2 Signer:) certificate SHA-256 digest:[ \t]*([0-9a-fA-F: ]+)[ \t]*\r?$', certs, re.M)
+          # 兼容不同 build-tools 的 Signer #1 与 V2 Signer 输出，拒绝多签名者。
+          if len(fingerprints) != 1 or normalize(fingerprints[0]) != expected:
+              raise SystemExit('正式签名证书缺失或不匹配')
+          if 'CN=Android Debug' in certs:
+              raise SystemExit('禁止 debug 证书')
+          if os.environ.get('EXPECTED_CERT') and normalize(os.environ['EXPECTED_CERT']) != expected:
+              raise SystemExit('EXPECTED_CERT_SHA256 与固定正式证书不一致')
+          package = re.search(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", Path('badging.txt').read_text(), re.M)
+          if not package or package.groups() != ('com.emxxme.colorplaynext', os.environ['VERSION_CODE'], os.environ['VERSION']):
+              raise SystemExit('APK 包名或版本与本次版本输出不一致')
+          with zipfile.ZipFile('app/build/outputs/apk/release/app-release.apk') as apk:
+              if apk.getinfo('lib/arm64-v8a/libhypercar_core.so').file_size <= 0:
+                  raise SystemExit('APK Rust 核心层为空')
+          Path('verified-cert.txt').write_text(expected)
+          PYIDENTITY
+          CERT=$(< verified-cert.txt)
 
           NAME="colorplay-next-${VERSION}-release.apk"
           cp "$APK" "$NAME"
-          SHA=$(sha256sum "$NAME" | cut -d' ' -f1)
+          sha256sum "$NAME" > "$NAME.sha256"
+          SHA=$(cut -d' ' -f1 "$NAME.sha256")
           SIZE=$(du -h "$NAME" | cut -f1)
           {
             echo "name=$NAME"
@@ -298,14 +306,7 @@ jobs:
             echo "> 解压后的 APK 体积见上表。"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 放在出包之后：单测挂了本次运行标红，但 APK 仍可下载
-      - name: 单元测试
-        run: |
-          set -eu
-          chmod +x gradlew
-          ./gradlew :app:testDebugUnitTest --stacktrace
-
-      # 发布放在单测**之后**：测试红了就不该产出「正式版」Release
+      # 发布放在 Lint、单测和 APK 身份校验之后：任何门禁失败均禁止正式发布
       # 手动 workflow_dispatch + publish=true 同样必须通过测试。
       - name: 防止正式版安装编号低于 Alpha
         if: steps.meta.outputs.publish == 'true'
@@ -354,6 +355,15 @@ jobs:
           # 注意：本块内不要出现 Actions 的表达式插值（双花括号），否则会先被
           # 替换成提交内容——多行内容会把这里撑成可执行的 shell 代码。
           SUBJECT=$(git log -1 --format=%s)
+          UPSTREAM_BASE=$(python3 - <<'PYBASE'
+          import re
+          from pathlib import Path
+          source = Path('app/src/main/java/io/github/hypercar/UpstreamBase.kt').read_text()
+          values = {key: re.search(r'const val ' + key + r' = "([^"]+)"', source).group(1) for key in ('VERSION', 'COMMIT')}
+          code = re.search(r'const val CODE = ([0-9]+)', source).group(1)
+          print(values['VERSION'] + ' / code=' + code + ' / ' + values['COMMIT'])
+          PYBASE
+          )
           # 注意：这里是**未加引号**的 heredoc，会展开 $VAR；正文里不要出现反引号
           # （未引号 heredoc 里反引号是命令替换，会执行 adb 并把错误写进 notes）。
           # SUBJECT 里的反引号无此问题：变量展开的结果不会被再次求值。
@@ -362,7 +372,7 @@ jobs:
 
           **更新说明**：${SUBJECT}
 
-          Android 自绘车机 UI，通过无线 CarPlay / AirPlay 投送高德／百度地图与音乐卡片。Kotlin / Compose 绘制界面并使用 MediaCodec 编码，Rust 负责协议协商和 H.264 / PCM 推流；无需 CarLife、CarWith 或 PC hub，不需要 root。
+          支持自绘 UI、CarWith、系统 CarLife+ 和新增 Car+ 等画面来源，通过无线 CarPlay / AirPlay 投送到车机。自绘模式使用 Kotlin / Compose 与 MediaCodec，Car+ 复用手机系统 CarLife 画面；Rust 负责协议协商与媒体转发，不要求 root。
 
           ### 当前功能
 
@@ -374,15 +384,15 @@ jobs:
 
           ### 本次修正
 
-          - 关于页新增可持久保存的“接收 Alpha 测试版更新”开关；不会自动安装，关闭不会降级。
-          - 双主题玻璃卡片、底栏增强边缘折射与透光，主题切换时重新绑定采样源和绘制节点。
-          - Switch、Button、Card 沿用公共玻璃组件，README 增加双主题与更新渠道实拍截图。
-          - Rust 辅助音频状态机测试显式注入仅测试用编码器，生产 AAC 编码路径不变。
-          - 模拟器曾出现渲染线程等待 GPU 图层上传导致的无响应，尚未确认根治；一加16与实车完整闭环仍待验证。
+          - 新增独立 Car+ 入口，保留原有模式；后台启动受系统限制时，需手动进入对应入口。
+          - Car+ 等待 CONTROL_READY 后再启动相关控制流程，避免协商未就绪时过早发起操作。
+          - 修补连接取消与重新连接流程，避免旧会话状态干扰新连接。
+          - 使用原正式证书签名，可覆盖已安装的 versionCode 215；本版安装编号以 APK 内校验结果和仓库 version.properties 为准。
+          - 上游基线（直接读取本次提交的 UpstreamBase.kt）：${UPSTREAM_BASE}；上述变更不代表已经完成实车验证。
 
           ### 使用要求与适配状态
 
-          - Android 12+、arm64-v8a；Shizuku 需启动并授权，用于虚拟屏、触摸和应用启动。
+          - Android 13+、arm64-v8a；自绘模式需要 Shizuku 用于虚拟屏与相关操作。Car+ 使用已导出的系统入口，不强制要求 Shizuku，系统限制后台启动时需手动打开。
           - 安装高德地图或百度地图；音乐卡片需授予通知使用权，并安装受支持的音乐播放器。
           - 接收端需支持无线 Apple CarPlay。BMW MGU-55 / iD8.5 为实车开发基准，WinPlay 用于联调；其他车型档案不代表已实车验证。
           - 分辨率优先采用车机 /info 像素尺寸，无有效上报时使用设置兜底。使用原生尺寸并做偶数对齐，默认 60 fps，仍可手动选择较低帧率，下次连接生效；UI 按上报安全区域布局。
@@ -402,21 +412,65 @@ jobs:
           > 使用相同正式签名且 versionCode 不低于已安装版本时可覆盖安装。本地与 CI 均读取仓库 version.properties；重复构建不递增，发布前统一升级显示版本和安装编号。
           EOF
 
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Release $TAG 已存在，覆盖附件"
-            gh release upload "$TAG" "$NAME" --repo "$REPO" --clobber
-            gh release edit "$TAG" --repo "$REPO" --title "ColorPlay Next ${VERSION}" --notes-file notes.md --latest
+          # 授权分页列表能看到草稿；不能用按 tag 读取接口预判草稿不存在。
+          python3 - <<'PYPREFLIGHT'
+          import json, os, subprocess
+          from pathlib import Path
+          matches = []
+          page = 1
+          while True:
+              releases = json.loads(subprocess.check_output(['gh', 'api', f"repos/{os.environ['REPO']}/releases?per_page=100&page={page}"], text=True))
+              matches.extend(item for item in releases if item['tag_name'] == os.environ['TAG'])
+              if len(releases) < 100:
+                  break
+              page += 1
+          if len(matches) > 1:
+              raise SystemExit('同名 Release 不唯一，请人工处理')
+          if matches and matches[0]['draft']:
+              raise SystemExit('同名草稿已存在，请人工核查，禁止覆盖或自动公开')
+          Path('existing-release.json').write_text(json.dumps(matches[0] if matches else None))
+          PYPREFLIGHT
+
+          # 两次执行同一校验：既有公开版本必须完全一致才可跳过；创建后也须证实上传完成。
+          cat > "$RUNNER_TEMP/verify-manual-release.py" <<'PYRELEASE'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          release = json.loads(Path('existing-release.json').read_text())
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+          require(release['tag_name'] == os.environ['TAG'], 'Release tag 不匹配')
+          require(not release['draft'] and not release['prerelease'] and release.get('published_at'), 'Release 尚未正式公开')
+          require(release.get('target_commitish') == os.environ['GITHUB_SHA'], '候选提交 SHA 不匹配，需人工核查')
+          refs = subprocess.check_output(['git', 'ls-remote', 'origin', f"refs/tags/{os.environ['TAG']}", f"refs/tags/{os.environ['TAG']}^{{}}"], text=True).splitlines()
+          peeled = [line.split()[0] for line in refs if line.endswith('^{}')]
+          commits = peeled or [line.split()[0] for line in refs]
+          require(len(commits) == 1 and commits[0] == os.environ['GITHUB_SHA'], '远程 tag 不指向本次提交')
+          name = os.environ['NAME']
+          local = Path(name).read_bytes()
+          digest = hashlib.sha256(local).hexdigest()
+          require(digest == os.environ['SHA'], '本地 APK SHA 不匹配')
+          require(Path(name + '.sha256').read_text() == f'{digest}  {name}\n', '本地校验附件不匹配')
+          for asset_name in (name, name + '.sha256'):
+              assets = [asset for asset in release['assets'] if asset['name'] == asset_name]
+              require(len(assets) == 1 and assets[0]['state'] == 'uploaded', '附件缺失、重复或未上传完成')
+              asset = assets[0]
+              expected = hashlib.sha256(Path(asset_name).read_bytes()).hexdigest()
+              require(asset.get('digest') == 'sha256:' + expected, 'GitHub 附件 digest 不匹配')
+              downloaded = subprocess.check_output(['gh', 'api', '-H', 'Accept: application/octet-stream', f"repos/{os.environ['REPO']}/releases/assets/{asset['id']}"])
+              require(hashlib.sha256(downloaded).hexdigest() == expected, '下载附件 SHA 不匹配')
+          PYRELEASE
+          if [ "$(< existing-release.json)" != "null" ]; then
+            python3 "$RUNNER_TEMP/verify-manual-release.py"
+            echo '同名公开版本与候选提交及本地附件完全一致，安全跳过创建'
           else
-            # --target 必须指向本次运行的提交：默认会打到默认分支 HEAD，
-            # 从非默认分支发布时 tag 会指错提交
-            gh release create "$TAG" "$NAME" \
-              --repo "$REPO" \
-              --target "$GITHUB_SHA" \
-              --title "ColorPlay Next ${VERSION}" \
-              --notes-file notes.md \
-              --latest
+            gh release create "$TAG" "$NAME" "$NAME.sha256" \
+              --repo "$REPO" --target "$GITHUB_SHA" \
+              --title "ColorPlay Next ${VERSION}" --notes-file notes.md --latest
           fi
-          gh release view "$TAG" --repo "$REPO" --json url --jq .url >> "$GITHUB_STEP_SUMMARY" || true
+          gh api "repos/$REPO/releases/tags/$TAG" > existing-release.json
+          python3 "$RUNNER_TEMP/verify-manual-release.py"
+          python3 -c 'import json, os; open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(json.load(open("existing-release.json"))["html_url"] + "\n")'
 
       - name: 正式版发布成功后同步并启动 Alpha
         if: steps.meta.outputs.publish == 'true' && github.ref == 'refs/heads/main' && steps.version.outputs.name == '0.2.12'

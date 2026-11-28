@@ -8,7 +8,8 @@ import io.github.hypercar.settings.SettingsStore
 
 /** Entry lifecycle uses the attempt snapshot; wire protocol is negotiated separately in Rust. */
 internal object CarLifeSourcePolicy {
-    fun isGateway(source: String) = source == "carwith" || source == "system_carlife"
+    fun isSystem(source: String) = source == "system_carlife" || io.github.hypercar.carplus.CarPlusSource.matches(source)
+    fun isGateway(source: String) = source == "carwith" || isSystem(source)
     fun canPrepareBmwInbound(source: String, profile: HeadUnitProfile, peer: String?): Boolean =
         if (isGateway(source)) profile.id == HeadUnitProfiles.BMW_ID85.id && mac(peer) != null
         else profile.protocolProfileId.startsWith("bmw_")

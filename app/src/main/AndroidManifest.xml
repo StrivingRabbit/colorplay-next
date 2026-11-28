@@ -68,6 +68,8 @@
         <intent><action android:name="android.speech.RecognitionService" /></intent>
         <package android:name="com.miui.carlink" />
         <package android:name="com.oplus.ocar" />
+        <package android:name="com.oplus.carplus" />
+        <package android:name="com.coloros.carplus" />
         <package android:name="com.baidu.carlife.oppo" />
         <package android:name="com.samsung.android.carlink" />
         <package android:name="com.samsung.android.smartcarlink" />
